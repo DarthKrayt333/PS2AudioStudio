@@ -2,7 +2,7 @@
 
 ![PS2 Audio Studio](docs/screenshot-editor.png)
 
-**Made by DarthKrayt333** – part of the HMSTH Modding Tool family.
+**Made by DarthKrayt333** – part of the HMSTH Modding Tool.
 
 A Windows audio editor, builder and converter for **PlayStation 2 game modding**.
 It reads and writes the audio formats PS2 games use, and lets you edit them in an Audacity-style editor.
