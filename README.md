@@ -2,7 +2,7 @@
 
 ![PS2 Audio Studio](docs/screenshot-editor.png)
 
-**Made by DarthKrayt333** – part of the HMSTH Modding Tool.
+**Made by DarthKrayt333**, also the author of HMSTH Modding Tool.
 
 A Windows audio editor, builder and converter for **PlayStation 2 game modding**.
 It reads and writes the audio formats PS2 games use, and lets you edit them in an Audacity-style editor.
@@ -40,10 +40,10 @@ It reads and writes the audio formats PS2 games use, and lets you edit them in a
 
 ## Download
 
-Go to the **[Releases](https://github.com/DarthKrayt333/PS2AudioStudio/releases)** page and download:
+Get the latest build from the **[Releases](https://github.com/DarthKrayt333/PS2AudioStudio/releases/latest)** page:
 
-- **`PS2AudioStudio-<version>-win-x64.zip`**: for 64-bit Windows (almost everyone). Unzip and run `PS2AudioStudio.exe`. .NET is included, nothing to install.
-- **`PS2AudioStudio-<version>-win-x86.zip`**: only for 32-bit Windows (less tested).
+- **`PS2AudioStudio-vX.Y.Z-win-x64.zip`**: for 64-bit Windows (almost everyone). Unzip and run `PS2AudioStudio.exe`. .NET is included, nothing to install.
+- **`PS2AudioStudio-vX.Y.Z-win-x86.zip`**: only for 32-bit Windows (less tested).
 
 Windows 10 / 11. The exe is not code-signed, so SmartScreen may warn on first run: choose *More info > Run anyway*. The full source is in this repository.
 
