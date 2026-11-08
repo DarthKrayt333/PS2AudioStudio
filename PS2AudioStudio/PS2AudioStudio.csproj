@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>PS2AudioStudio</RootNamespace>
+    <AssemblyName>PS2AudioStudio</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+
+    <!-- Version info shown in the exe's Properties > Details -->
+    <Version>1.0.0</Version>
+    <Authors>DarthKrayt333</Authors>
+    <Product>PS2 Audio Studio</Product>
+    <Description>Audio editor, builder and converter for PS2 game modding</Description>
+    <Copyright>Copyright (c) 2026 DarthKrayt333</Copyright>
+
+    <!-- Try to drop the cs, de, es... language folders from publish output -->
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.2.1" />
+  </ItemGroup>
+
+</Project>
