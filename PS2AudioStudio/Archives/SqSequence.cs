@@ -34,6 +34,9 @@ namespace PS2AudioStudio.Archives
 
         public override string ToString() => Name ?? ("Song " + Index);
 
+        public byte LoopEndValue = 1;          // CC#99 value that ends the loop (original SQ files use 1, some tools write 127)
+        public byte LoopChannel = 0;           // channel the markers sit on
+
         public void FindLoop()
         {
             LoopStartIndex = -1; LoopEndIndex = -1;
@@ -41,8 +44,62 @@ namespace PS2AudioStudio.Archives
             {
                 var e = Events[i];
                 if (e.Type != SqEventType.Cc || e.A != 99) continue;
-                if (e.B == 0) { if (LoopStartIndex < 0) LoopStartIndex = i; }
-                else if (e.B == 127) { if (LoopEndIndex < 0 && i > LoopStartIndex) LoopEndIndex = i; }
+                if (e.B == 0)
+                {
+                    if (LoopStartIndex < 0) { LoopStartIndex = i; LoopChannel = e.Channel; }
+                }
+                else if (e.B == 1 || e.B == 127)
+                {
+                    if (LoopEndIndex < 0 && i > LoopStartIndex) { LoopEndIndex = i; LoopEndValue = e.B; LoopChannel = e.Channel; }
+                }
+            }
+        }
+
+        /// <summary>Tick of a time in seconds (follows the tempo changes).</summary>
+        public long SecondsToTick(double sec)
+        {
+            int ppqn = Ppqn > 0 ? Ppqn : 480;
+            double tempo = 500000;
+            long lastTick = 0; double lastSec = 0;
+            foreach (var e in Events)
+            {
+                if (e.Type != SqEventType.Tempo || e.Tempo <= 0) continue;
+                double segSec = (e.Tick - lastTick) * tempo / 1e6 / ppqn;
+                if (lastSec + segSec >= sec) break;
+                lastSec += segSec; lastTick = e.Tick; tempo = e.Tempo;
+            }
+            double ticks = (sec - lastSec) * 1e6 * ppqn / tempo;
+            return Math.Max(0, lastTick + (long)Math.Round(ticks));
+        }
+
+        /// <summary>Moves (or creates) the two CC#99 loop markers at the given ticks.</summary>
+        public void SetLoopTicks(long startTick, long endTick)
+        {
+            if (endTick <= startTick) throw new ArgumentException("The loop end must be after the loop start.");
+            FindLoop();
+            var kill = new List<int>();
+            if (LoopStartIndex >= 0) kill.Add(LoopStartIndex);
+            if (LoopEndIndex >= 0) kill.Add(LoopEndIndex);
+            foreach (int i in kill.OrderByDescending(x => x)) Events.RemoveAt(i);
+
+            int p = 0;                                            // start marker: before every event at that tick
+            while (p < Events.Count && Events[p].Tick < startTick) p++;
+            Events.Insert(p, new SqEvent { Tick = startTick, Type = SqEventType.Cc, Channel = LoopChannel, A = 99, B = 0 });
+
+            int q = 0;                                            // end marker: before the events at that tick, after their note-offs
+            while (q < Events.Count && Events[q].Tick < endTick) q++;
+            while (q < Events.Count && Events[q].Tick == endTick && Events[q].Type == SqEventType.NoteOff) q++;
+            Events.Insert(q, new SqEvent { Tick = endTick, Type = SqEventType.Cc, Channel = LoopChannel, A = 99, B = LoopEndValue });
+            FindLoop();
+        }
+
+        /// <summary>Short text about the CC#99 events (for the status line).</summary>
+        public string Cc99Summary
+        {
+            get
+            {
+                var parts = Events.Where(e => e.Type == SqEventType.Cc && e.A == 99).Take(6).Select(e => $"{e.B}@tick {e.Tick}").ToList();
+                return parts.Count == 0 ? "no CC#99 events" : "CC#99: " + string.Join(", ", parts);
             }
         }
 
@@ -115,7 +172,7 @@ namespace PS2AudioStudio.Archives
                     case SqEventType.NoteOff: track.WriteByte((byte)(0x80 | ch)); track.WriteByte((byte)(e.A & 0x7F)); track.WriteByte(0x40); break;
                     case SqEventType.Cc:
                         track.WriteByte((byte)(0xB0 | ch)); track.WriteByte((byte)(e.A & 0x7F)); track.WriteByte((byte)(e.B & 0x7F));
-                        if (e.A == 99 && (e.B == 0 || e.B == 127))      // readable loop marker for DAWs (delta 0)
+                        if (e.A == 99 && (e.B == 0 || e.B == 1 || e.B == 127))      // readable loop marker for DAWs (delta 0)
                             WriteMeta(track, 0x06, e.B == 0 ? "loopStart" : "loopEnd");
                         break;
                     case SqEventType.Program: track.WriteByte((byte)(0xC0 | ch)); track.WriteByte((byte)(e.A & 0x7F)); break;
@@ -195,7 +252,7 @@ namespace PS2AudioStudio.Archives
                             if (txt.Equals("loopStart", StringComparison.OrdinalIgnoreCase))
                                 markers.Add((new SqEvent { Tick = tick, Type = SqEventType.Cc, A = 99, B = 0 }, order++));
                             else if (txt.Equals("loopEnd", StringComparison.OrdinalIgnoreCase))
-                                markers.Add((new SqEvent { Tick = tick, Type = SqEventType.Cc, A = 99, B = 127 }, order++));
+                                markers.Add((new SqEvent { Tick = tick, Type = SqEventType.Cc, A = 99, B = 1 }, order++));
                         }
                         q += ml;
                         if (type == 0x2F) break;
@@ -246,28 +303,63 @@ namespace PS2AudioStudio.Archives
             ms.Write(BitConverter.GetBytes((ushort)Ppqn), 0, 2);            // resolution
 
             long last = 0;
-            foreach (var e in Events)
+            int running = -1;           // last channel status byte written (meta events do not change it)
+            bool skipDelta = false;     // previous event had bit 7 set -> this event's delta (0) is not written
+
+            for (int i = 0; i < Events.Count; i++)
             {
-                WriteVlq(ms, Math.Max(0, e.Tick - last));
-                last = e.Tick;
+                var e = Events[i];
+                long delta = Math.Max(0, e.Tick - last);
+                last = Math.Max(last, e.Tick);
+
+                if (!skipDelta) WriteVlq(ms, delta);
+                skipDelta = false;
+
+                if (e.Type == SqEventType.Tempo)
+                {
+                    ms.WriteByte(0xFF); ms.WriteByte(0x51); ms.WriteByte(0x03);
+                    ms.WriteByte((byte)(e.Tempo >> 16)); ms.WriteByte((byte)(e.Tempo >> 8)); ms.WriteByte((byte)e.Tempo);
+                    continue;
+                }
+
+                // next event at the same tick (and not a meta event)
+                bool zeroNext = false;
+                if (i + 1 < Events.Count)
+                {
+                    var n = Events[i + 1];
+                    zeroNext = n.Type != SqEventType.Tempo && n.Tick <= last;
+                }
+
                 int ch = e.Channel & 0x0F;
+                int status, nData;
+                byte d1 = (byte)(e.A & 0x7F), d2 = 0;
                 switch (e.Type)
                 {
-                    case SqEventType.NoteOn: ms.WriteByte((byte)(0x90 | ch)); ms.WriteByte((byte)(e.A & 0x7F)); ms.WriteByte((byte)Math.Max(1, e.B & 0x7F)); break;
-                    case SqEventType.NoteOff: ms.WriteByte((byte)(0x80 | ch)); ms.WriteByte((byte)(e.A & 0x7F)); break;   // SQ note-off has NO velocity byte
-                    case SqEventType.Cc: ms.WriteByte((byte)(0xB0 | ch)); ms.WriteByte((byte)(e.A & 0x7F)); ms.WriteByte((byte)(e.B & 0x7F)); break;
-                    case SqEventType.Program: ms.WriteByte((byte)(0xC0 | ch)); ms.WriteByte((byte)(e.A & 0x7F)); break;
-                    case SqEventType.PitchBend: ms.WriteByte((byte)(0xE0 | ch)); ms.WriteByte((byte)(e.A & 0x7F)); ms.WriteByte((byte)(e.B & 0x7F)); break;
-                    case SqEventType.Tempo:
-                        ms.WriteByte(0xFF); ms.WriteByte(0x51); ms.WriteByte(0x03);
-                        ms.WriteByte((byte)(e.Tempo >> 16)); ms.WriteByte((byte)(e.Tempo >> 8)); ms.WriteByte((byte)e.Tempo);
-                        break;
+                    case SqEventType.NoteOn: status = 0x90 | ch; nData = 2; d2 = (byte)Math.Max(1, e.B & 0x7F); break;
+                    case SqEventType.NoteOff: status = 0x80 | ch; nData = 1; break;       // SQ note-off has NO velocity byte
+                    case SqEventType.Cc: status = 0xB0 | ch; nData = 2; d2 = (byte)(e.B & 0x7F); break;
+                    case SqEventType.Program: status = 0xC0 | ch; nData = 1; break;
+                    case SqEventType.PitchBend: status = 0xE0 | ch; nData = 2; d2 = (byte)(e.B & 0x7F); break;
+                    default: continue;
                 }
+
+                // running status is used when the status matches (never when the first data byte is 0)
+                bool writeStatus = running != status || d1 == 0;
+                if (writeStatus) ms.WriteByte((byte)status);
+                running = status;
+
+                // the "next delta is 0" flag (bit 7) is ONLY used on events that write their own status byte;
+                // running-status events get a normal explicit 00 delta, exactly like the original files
+                if (!writeStatus) zeroNext = false;
+
+                if (nData == 1) ms.WriteByte((byte)(zeroNext ? (d1 | 0x80) : d1));
+                else { ms.WriteByte(d1); ms.WriteByte((byte)(zeroNext ? (d2 | 0x80) : d2)); }
+                skipDelta = zeroNext;
             }
+
             WriteVlq(ms, 0);
             ms.Write(new byte[] { 0xFF, 0x2F, 0x00 }, 0, 3);
-            while (ms.Length % 16 != 0) ms.WriteByte(0);
-            return ms.ToArray();
+            return ms.ToArray();                     // padding is added by the MIDI chunk
         }
 
         // ================================================================= helpers
@@ -447,6 +539,21 @@ namespace PS2AudioStudio.Archives
                             song.Events.Add(new SqEvent { Tick = tick, Channel = ch, Type = SqEventType.PitchBend, A = lsb, B = msb });
                             break;
                         }
+
+                    case 0xA0:   // poly aftertouch: key + pressure (ignored, but must not end the song)
+                        {
+                            if (p + 2 > limit) goto done;
+                            p++;
+                            DataByte(ref p);
+                            break;
+                        }
+                    case 0xD0:   // channel pressure (ignored)
+                        {
+                            if (p >= limit) goto done;
+                            DataByte(ref p);
+                            break;
+                        }
+
                     case 0xF0:
                         if (st == 0xFF)
                         {
@@ -459,7 +566,13 @@ namespace PS2AudioStudio.Archives
                                 p += 4;
                                 song.Events.Add(new SqEvent { Tick = tick, Type = SqEventType.Tempo, Tempo = tempo });
                             }
-                            else goto done;      // 0x2F end of track (or unknown meta)
+                            else if (type == 0x2F) goto done;     // end of track
+                            else
+                            {
+                                long ml = SqSong.ReadVlq(d, ref p);   // unknown meta: skip it instead of ending the song
+                                if (ml < 0 || p + ml > limit) goto done;
+                                p += (int)ml;
+                            }
                         }
                         break;
                     default:
@@ -476,19 +589,24 @@ namespace PS2AudioStudio.Archives
         private static byte[] BuildMidiChunk(List<byte[]> blocks)
         {
             int count = blocks.Count;
-            int first = (16 + count * 4 + 15) / 16 * 16;
+            int first = 16 + count * 4;                       // first song starts right after the offset table (0x14 for one song)
             using var chunk = new MemoryStream();
             chunk.Write(Encoding.ASCII.GetBytes("IECSidiM"), 0, 8);
-            chunk.Write(BitConverter.GetBytes(0), 0, 4);                      // size (patched)
+            chunk.Write(BitConverter.GetBytes(0), 0, 4);                      // size (patched below)
             chunk.Write(BitConverter.GetBytes(count - 1), 0, 4);              // max index
             int pos = first;
-            foreach (var b in blocks) { chunk.Write(BitConverter.GetBytes(pos), 0, 4); pos += (b.Length + 15) / 16 * 16; }
-            while (chunk.Length < first) chunk.WriteByte(0);
-            foreach (var b in blocks)
+            for (int i = 0; i < count; i++)
             {
-                chunk.Write(b, 0, b.Length);
-                while (chunk.Length % 16 != 0) chunk.WriteByte(0);
+                chunk.Write(BitConverter.GetBytes(pos), 0, 4);
+                pos += blocks[i].Length;
+                if (i < count - 1) pos = (pos + 3) & ~3;                      // songs in the middle are 4-byte aligned
             }
+            for (int i = 0; i < count; i++)
+            {
+                chunk.Write(blocks[i], 0, blocks[i].Length);
+                if (i < count - 1) while (chunk.Length % 4 != 0) chunk.WriteByte(0xFF);
+            }
+            while (chunk.Length % 16 != 0) chunk.WriteByte(0xFF);             // whole chunk padded to 16 with FF
             byte[] cb = chunk.ToArray();
             Array.Copy(BitConverter.GetBytes(cb.Length), 0, cb, 8, 4);
             return cb;
@@ -538,10 +656,14 @@ namespace PS2AudioStudio.Archives
                 using var h = new MemoryStream();
                 h.Write(Encoding.ASCII.GetBytes("IECSsreV"), 0, 8);
                 h.Write(BitConverter.GetBytes(0x10), 0, 4);
-                h.Write(BitConverter.GetBytes(0x00020001), 0, 4);
-                h.Write(Encoding.ASCII.GetBytes("IECSdaeH"), 0, 8);
+                h.Write(BitConverter.GetBytes(0x00020000), 0, 4);
+                h.Write(Encoding.ASCII.GetBytes("IECSuqeS"), 0, 8);
                 h.Write(BitConverter.GetBytes(0x20), 0, 4);
-                for (int i = 0; i < 5; i++) h.Write(BitConverter.GetBytes(0), 0, 4);
+                h.Write(BitConverter.GetBytes(0), 0, 4);          // total file size (patched below)
+                h.Write(BitConverter.GetBytes(-1), 0, 4);
+                h.Write(BitConverter.GetBytes(0x30), 0, 4);       // offset of the MIDI chunk
+                h.Write(BitConverter.GetBytes(-1), 0, 4);
+                h.Write(BitConverter.GetBytes(-1), 0, 4);
                 head = h.ToArray();
             }
 
