@@ -75,7 +75,6 @@ namespace PS2AudioStudio
             tb.Controls.Add(bLoopSel); tb.Controls.Add(bLS); tb.Controls.Add(bLE);
             tb.Controls.Add(Ui.Lbl("Snap:")); tb.Controls.Add(cmbSnap);
             tb.Controls.Add(Ui.Lbl("   Zoom:")); tb.Controls.AddRange(new Control[] { bZi, bZo, bZf, bZs });
-            tb.Controls.Add(Ui.Lbl("   Drag out (press & drag to Explorer):"));
 
             lblInfo = new Label
             {
@@ -188,7 +187,7 @@ namespace PS2AudioStudio
             UpdateTitle();
         }
 
-        /// <summary>File > New. Which tabs are cleared depends on Settings (active tab only / all tabs / custom).</summary>
+        /// <summary>File > New. Which tabs are cleared depends on Settings (active tab only / all tabs / custom). No questions about length.</summary>
         private void NewProject()
         {
             var cfg = AppSettings.Current;
@@ -197,14 +196,9 @@ namespace PS2AudioStudio
             bool clrPs = cfg.ShouldClear(1, active);
             bool clrAf = cfg.ShouldClear(2, active);
 
-            // the editor becomes a silent project only when it is the tab you are on; otherwise it is simply emptied
+            // the editor becomes a 5 second silent project only when it is the tab you are on; otherwise it is simply emptied
             bool silent = clrEd && active == 0;
-            double secs = 5;
-            if (silent)
-            {
-                if (!Prompt.Number(this, "New project", "Length of the new silent project (seconds):", 5, out secs)) return;
-                secs = Math.Max(0.1, Math.Min(3600, secs));
-            }
+            const double defaultSeconds = 5;
 
             bool dirty = (clrPs && ((bank != null && bank.Modified) || sqModified)) || (clrAf && afs != null && afs.Modified);
             if (dirty)
@@ -217,11 +211,18 @@ namespace PS2AudioStudio
             TransportStop();
             if (clrPs) ClearPsf2Tab();
             if (clrAf) ClearAfsTab();
+
             if (clrEd)
             {
-                if (silent) SetEditorBuffer(new AudioBuffer(44100, 2, (int)(44100 * secs)), "untitled.wav", false);
+                if (silent)
+                {
+                    int rate = cfg.RecordRate;      // new project = the recording rate from Settings (default 48000)
+                    SetEditorBuffer(new AudioBuffer(rate, 2, (int)(rate * defaultSeconds)), "untitled.wav", false);
+                    wave.MarkFullFit();             // new project: the 5 s track fills 100% of the width
+                }
                 else ClearEditorTab();
             }
+
             UpdateTitle();
 
             var parts = new List<string>();
@@ -493,12 +494,310 @@ namespace PS2AudioStudio
 
         private void FxGenSilence()
         {
-            if (wave.Buffer == null) { NewProject(); return; }
-            if (!Prompt.Number(this, "Generate silence", "Seconds of silence to insert at the cursor:", 1, out double secs)) return;
+            bool empty = wave.Buffer == null;
+            if (!Prompt.Number(this, "Generate silence",
+                    empty ? "Seconds of silence to create:" : "Seconds of silence to insert at the cursor:", 1, out double secs)) return;
+            secs = Math.Max(0.001, Math.Min(3600, secs));
+
+            if (empty)
+            {
+                int sr = AppSettings.Current.RecordRate;
+                SetEditorBuffer(new AudioBuffer(sr, 2, (int)(sr * secs)), "silence.wav");
+                return;
+            }
+
             PushUndo();
-            var sil = new AudioBuffer(wave.Buffer.SampleRate, wave.Buffer.Channels, (int)(wave.Buffer.SampleRate * Math.Max(0.001, secs)));
+            var sil = new AudioBuffer(wave.Buffer.SampleRate, wave.Buffer.Channels, (int)(wave.Buffer.SampleRate * secs));
             wave.Buffer.InsertAt(wave.EditCursor, sil);
             wave.BufferModified(); SyncLoopUI();
+        }
+
+        private ToolStripMenuItem BuildReverbMenu()
+        {
+            var root = new ToolStripMenuItem("Reverb");
+            foreach (var p in ReverbEffect.Presets)
+            {
+                var preset = p;
+                root.DropDownItems.Add(new ToolStripMenuItem(preset.Name, null, (s, e) => FxReverb(preset)));
+            }
+            return root;
+        }
+
+        /// <summary>Stops the recorder, unlocks the menus and puts the previously open audio back.</summary>
+
+        // ===== Live recording view =====
+        private const double LiveStartSeconds = 30.0;   // window width the very first time
+        private const double LiveFollowAt = 1.0;        // 1.0 = the view follows only at the right edge
+        private const double LiveLineAt = 0.4;          // only used when the line is far outside the view
+        private const int LiveMaxDispFrames = 2400000;  // wider windows are drawn with reduced detail
+        private bool _recLive;
+        private AudioBuffer _recStash;                  // the audio that was open before Rec
+        private int _recStashCursor;
+        private int _recInsertAt;
+        private long _recLastFrames = -1;
+        private AudioBuffer _liveEmpty;
+        private float[] _liveArr;
+        private long _liveStart = -1;                   // first frame of the visible window (open-audio mode)
+        private readonly System.Diagnostics.Stopwatch _recDrawWatch = new System.Diagnostics.Stopwatch();
+
+        private AudioBuffer _viewFor;
+        private double _viewWinSec = -1;                // window width in seconds
+        private double _viewStartSec = -1;              // left edge of the window in seconds
+
+        /// <summary>Where a recording goes: start of the selection, else the line.</summary>
+        private int RecordInsertPoint()
+        {
+            var b = wave.Buffer;
+            if (b == null) return 0;
+            int at = wave.HasSelection ? wave.SelStart : wave.EditCursor;
+            return Math.Max(0, Math.Min(b.TotalFrames, at));
+        }
+
+        /// <summary>Track position (seconds) where the recording started: the clock counts up from here.</summary>
+        private double RecClockOffset()
+        {
+            var b = _recLive ? _recStash : wave.Buffer;
+            if (b == null || b.TotalFrames == 0 || b.SampleRate <= 0) return 0;
+            int at = _recLive ? _recInsertAt : RecordInsertPoint();
+            return (double)at / b.SampleRate;
+        }
+
+        /// <summary>Called from the UI timer while recording.</summary>
+        private void UpdateLiveRecording()
+        {
+            if (!recorder.IsRecording) return;
+            if (!_recLive)
+            {
+                _recLive = true;
+                _recStash = wave.Buffer;                    // keep the open audio aside
+                _recStashCursor = RecordInsertPoint();      // the insert point is fixed now
+                _recInsertAt = _recStashCursor;
+                _recLastFrames = -1;
+                _liveStart = -1;
+                _recDrawWatch.Restart();
+                if (tabs.SelectedTab != tabEditor) tabs.SelectedTab = tabEditor;
+
+                int rate = recorder.SampleRate;
+                bool hasOld = _recStash != null && _recStash.TotalFrames > 0;
+                double win = _viewWinSec > 0 ? _viewWinSec : LiveStartSeconds;
+                double start = _viewStartSec;
+
+                // audio is open: use the view that is on screen RIGHT NOW (your zoom and scroll position)
+                if (hasOld && wave.GetViewSeconds(out double vs, out double vw))
+                {
+                    win = vw;
+                    start = vs;
+                }
+                if (!hasOld) win = Math.Min(win, 60.0);
+                wave.LiveMaxSeconds = hasOld ? 3600.0 : 60.0;
+
+                if (start >= 0 && rate > 0) _liveStart = (long)(start * rate);
+                wave.LiveBegin(win, rate);
+                LiveRedraw(true);
+                return;
+            }
+            int every = (int)Math.Max(40, Math.Min(400, wave.LiveWindowSeconds * 1.3));   // wide windows redraw a bit slower
+            if (_recDrawWatch.ElapsedMilliseconds < every) return;
+            _recDrawWatch.Restart();
+            LiveRedraw(false);
+        }
+
+        private void LiveRedraw(bool force)
+        {
+            long fc = recorder.FramesCaptured;
+            if (!force && fc == _recLastFrames) return;
+            int rate = recorder.SampleRate;
+            if (rate <= 0) return;
+            double secs = wave.LiveWindowSeconds + 2.0 / rate;
+
+            if (_recStash != null && _recStash.TotalFrames > 0)
+            {
+                LiveRedrawWithOld(fc, rate, secs);
+                return;
+            }
+
+            // empty editor: only the new recording
+            int line;
+            var snap = recorder.SnapshotView(secs * LiveFollowAt, secs, out line);
+            double leftSec = 0;
+            if (snap == null)
+            {
+                line = 0;
+                int frames = (int)(secs * rate) + 4;
+                if (_liveEmpty == null || _liveEmpty.SampleRate != rate || _liveEmpty.TotalFrames < frames)
+                    _liveEmpty = new AudioBuffer(new float[frames * 2], rate, 2);
+                snap = _liveEmpty;
+            }
+            else leftSec = Math.Max(0, fc - line) / (double)rate;
+            _recLastFrames = fc;
+            wave.LiveUpdate(snap, line, leftSec);
+        }
+
+        /// <summary>
+        /// Audio is already open: old audio before the line + the new recording growing from the line +
+        /// the old audio after the line pushed to the right. Display only - the real insert happens on Stop.
+        /// Very wide windows are drawn with reduced detail (the loudest sample of each small block).
+        /// </summary>
+        private void LiveRedrawWithOld(long fc, int rate, double secs)
+        {
+            fc = Math.Max(fc, recorder.FramesCaptured);
+            var old = _recStash;
+            int oc = Math.Max(1, old.Channels);
+            double ratio = (double)old.SampleRate / rate;           // old frames per recorder frame
+            long insertRec = (long)(_recInsertAt / ratio);          // insert point in recorder frames
+
+            long win = Math.Max(1, (long)(secs * rate));
+            long tol = rate / 5;                                    // 0.2 s tolerance so rounding never moves the view
+            int D = (int)Math.Max(1, (win + LiveMaxDispFrames - 1) / LiveMaxDispFrames);   // reduction factor
+            int dRate = Math.Max(1, rate / D);
+            int total = (int)(win / D) + 2;
+
+            // the part of the new recording that is inside the window
+            int line = 0;
+            AudioBuffer snap = null;
+            if (fc > 0)
+            {
+                double need = Math.Min(secs, (double)fc / rate) + 0.1;
+                snap = recorder.SnapshotView(need, need, out line);
+            }
+            int ch = snap != null ? snap.Channels : 2;
+            long recFrames = snap == null ? 0 : Math.Max(fc, (long)line);
+            long recOff = recFrames - line;
+            long lineT = insertRec + recFrames;                     // the line on the combined timeline
+
+            // the view you set is kept. It only moves when the line is far outside it (or there is no view yet).
+            if (_liveStart < 0 || (recFrames == 0 && (insertRec < _liveStart - tol || insertRec > _liveStart + win + tol)))
+            {
+                if (insertRec <= win - tol) _liveStart = 0;
+                else _liveStart = Math.Max(0, insertRec - (long)(LiveLineAt * win));
+            }
+            if (lineT > _liveStart + win) _liveStart = lineT - win;  // follow ONLY when the line hits the right edge
+
+            int need2 = total * ch;
+            if (_liveArr == null || _liveArr.Length != need2) _liveArr = new float[need2];
+
+            float[] os = old.Samples;
+            float[] ss = snap != null ? snap.Samples : null;
+            long oldFrames = old.TotalFrames;
+            int stride = Math.Max(1, D / 4);
+
+            for (int i = 0; i < total; i++)
+            {
+                long tb = _liveStart + (long)i * D;
+                for (int c = 0; c < ch; c++)
+                {
+                    float best = 0, bestAbs = -1;
+                    for (int k = 0; k < D; k += stride)
+                    {
+                        long t = tb + k;
+                        long r = t - insertRec;
+                        float v;
+                        if (r >= 0 && r < recFrames)
+                        {
+                            long idx = r - recOff;
+                            if (ss == null || idx < 0 || idx >= line) continue;
+                            v = ss[(int)idx * ch + c];
+                        }
+                        else
+                        {
+                            long tr = r < 0 ? t : t - recFrames;    // position on the old audio
+                            long of = (long)(tr * ratio);
+                            if (of < 0 || of >= oldFrames) continue;
+                            v = os[(int)of * oc + Math.Min(c, oc - 1)];
+                        }
+                        float a = v < 0 ? -v : v;
+                        if (a > bestAbs) { bestAbs = a; best = v; }
+                    }
+                    _liveArr[i * ch + c] = best;
+                }
+            }
+
+            _recLastFrames = fc;
+            var comp = new AudioBuffer(_liveArr, dRate, ch);
+            wave.LiveUpdate(comp, (int)((lineT - _liveStart) / D), (double)_liveStart / rate);
+        }
+
+        /// <summary>+ / - / mouse wheel while recording.</summary>
+        private void LiveZoom(bool zoomIn)
+        {
+            if (!_recLive) return;
+            wave.LiveZoom(zoomIn ? 1.5 : 1.0 / 1.5);
+            LiveRedraw(true);
+        }
+
+        /// <summary>Stops the recorder, remembers the zoom and view position, puts the previously open audio back in the SAME view.</summary>
+        private AudioBuffer StopRecorderAndRestore()
+        {
+            long fcStop = recorder.FramesCaptured;
+            int rate = recorder.SampleRate;
+            var rec = recorder.Stop();
+            _recInsertAt = RecordInsertPoint();
+            if (_recLive)
+            {
+                _recLive = false;
+                _recInsertAt = _recStashCursor;
+                var stash = _recStash;
+                _recStash = null;
+
+                // remember the view (width + left edge) for the next Rec
+                double winSec = wave.LiveWindowSeconds;
+                if (winSec > 0 && rate > 0)
+                {
+                    _viewWinSec = winSec;
+                    if (stash != null && stash.TotalFrames > 0)
+                        _viewStartSec = _liveStart >= 0 ? (double)_liveStart / rate : -1;
+                    else
+                    {
+                        long w = (long)(winSec * rate);
+                        _viewStartSec = Math.Max(0, fcStop - w) / (double)rate;
+                    }
+                }
+
+                wave.LiveEnd();
+                wave.SetBuffer(stash, false);
+                if (stash != null && stash.TotalFrames > 0)
+                {
+                    wave.SetCursor(_recInsertAt);
+                    if (_viewWinSec > 0 && _viewStartSec >= 0) wave.SetViewSeconds(_viewStartSec, _viewWinSec);
+                }
+            }
+            return rec;
+        }
+
+        private static void ApplyMenuForeColor(ToolStripMenuItem item, System.Drawing.Color fore)
+        {
+            item.ForeColor = fore;
+            if (!item.HasDropDownItems) return;
+            item.DropDown.ForeColor = fore;
+            foreach (ToolStripItem child in item.DropDownItems)
+            {
+                child.ForeColor = fore;
+                if (child is ToolStripMenuItem m) ApplyMenuForeColor(m, fore);
+            }
+        }
+
+        private void FxReverb(ReverbPreset p)
+        {
+            if (!Range(out int s, out int e)) return;
+            if (!Prompt.Number(this, "Reverb - " + p.Name, "Amount in % (0 = dry, 100 = reverb only):", p.Mix, out double mix)) return;
+
+            tabs.SelectedTab = tabEditor;
+            PushUndo();
+            var b = wave.Buffer;
+            int tail = (int)(p.TailSeconds * b.SampleRate);
+            // at the end of a non-looping file the tail needs room: append silence for it
+            if (e == b.TotalFrames && !b.LoopEnabled)
+                b.InsertAt(b.TotalFrames, new AudioBuffer(b.SampleRate, b.Channels, tail));
+            int outEnd = Math.Min(b.TotalFrames, e + tail);
+
+            float peak;
+            Cursor = Cursors.WaitCursor;
+            try { peak = ReverbEffect.Process(b, s, e, outEnd, p, mix); }
+            finally { Cursor = Cursors.Default; }
+
+            wave.BufferModified(); SyncLoopUI();
+            SetStatus($"Reverb: {p.Name}, {mix:0}%" + (wave.HasSelection ? " (selection)" : " (whole file)") +
+                      (peak > 1f ? $" - peaks are {20 * Math.Log10(peak):0.0} dB over full scale: use Effects > Normalize or Amplify with a negative gain." : ""));
         }
 
         // ================================================================= save audio
