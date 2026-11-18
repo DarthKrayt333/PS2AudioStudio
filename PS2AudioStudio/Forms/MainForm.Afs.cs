@@ -20,6 +20,10 @@ namespace PS2AudioStudio
         private CheckBox chkLoopAfs;
         private SplitContainer splitAfs;
 
+        // context-menu items that only make sense for exactly one / at least one selected entry
+        private readonly List<ToolStripItem> afsSingleItems = new List<ToolStripItem>();
+        private readonly List<ToolStripItem> afsAnyItems = new List<ToolStripItem>();
+
         // ================================================================= tab
         private TabPage BuildAfsTab()
         {
@@ -35,15 +39,16 @@ namespace PS2AudioStudio
             bar.Controls.AddRange(new Control[] { bOpen, bNew, bSave, bSaveAs, bExtAll, bAdd });
 
             lblAfsInfo = new Label { Dock = DockStyle.Bottom, Height = 24, ForeColor = Color.Yellow, BackColor = Ui.Panel, Padding = new Padding(6, 4, 0, 0), Font = new Font("Consolas", 9) };
-            lblAfsInfo.Text = "Drop an .AFS file here. Right-click an entry for Extract / Replace / Rename / Remove. Drag entries out to Explorer to extract them.";
+            lblAfsInfo.Text = "Drop an .AFS file here. Shift / Ctrl+click selects several entries. Right-click for Extract / Replace / Rename / Remove. Drag entries out to Explorer to extract them.";
 
             splitAfs = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal };
 
             lvAfs = new ListView { Dock = DockStyle.Fill };
             Ui.StyleList(lvAfs);
+            lvAfs.MultiSelect = true;
             lvAfs.Columns.Add("#", 55); lvAfs.Columns.Add("Name", 230); lvAfs.Columns.Add("Offset", 95);
             lvAfs.Columns.Add("Size", 95); lvAfs.Columns.Add("Type", 60); lvAfs.Columns.Add("Info", 260);
-            lvAfs.SelectedIndexChanged += (s, e) => PreviewSelectedAfs(false);
+            lvAfs.SelectedIndexChanged += (s, e) => OnAfsSelectionChanged();
             lvAfs.DoubleClick += (s, e) => PreviewSelectedAfs(true);
             lvAfs.ItemDrag += (s, e) => DragOutAfs();
             lvAfs.ContextMenuStrip = BuildAfsMenu();
@@ -79,20 +84,33 @@ namespace PS2AudioStudio
         private ContextMenuStrip BuildAfsMenu()
         {
             var m = Ui.Ctx();
-            m.Items.Add(Mi("▶ Play / preview", (s, e) => PreviewSelectedAfs(true)));
-            m.Items.Add(Mi("Open in Audio Editor", (s, e) => SendAfsToEditor()));
+            afsSingleItems.Clear(); afsAnyItems.Clear();
+
+            ToolStripMenuItem Single(string text, EventHandler h) { var mi = Mi(text, h); afsSingleItems.Add(mi); m.Items.Add(mi); return mi; }
+            ToolStripMenuItem Any(string text, EventHandler h) { var mi = Mi(text, h); afsAnyItems.Add(mi); m.Items.Add(mi); return mi; }
+
+            Single("▶ Play / preview", (s, e) => PreviewSelectedAfs(true));
+            Single("Open in Audio Editor", (s, e) => SendAfsToEditor());
             m.Items.Add(new ToolStripSeparator());
-            m.Items.Add(Mi("Extract...", (s, e) => ExtractAfsEntry(false)));
-            m.Items.Add(Mi("Extract as .wav...", (s, e) => ExtractAfsEntry(true)));
+            Any("Extract (all selected)...", (s, e) => ExtractAfsEntry(false));
+            Any("Extract (all selected) as .wav...", (s, e) => ExtractAfsEntry(true));
             m.Items.Add(new ToolStripSeparator());
-            m.Items.Add(Mi("Replace with file...", (s, e) => ReplaceAfsDlg()));
-            m.Items.Add(Mi("Replace with Audio Editor contents (encoded as this entry's format)", (s, e) => ReplaceAfsFromEditor()));
-            m.Items.Add(Mi("Rename...", (s, e) => RenameAfsEntry()));
-            m.Items.Add(Mi("Remove", (s, e) => RemoveAfsEntry()));
+            Single("Replace with file...", (s, e) => ReplaceAfsDlg());
+            Single("Replace with Audio Editor contents (encoded as this entry's format)", (s, e) => ReplaceAfsFromEditor());
+            Single("Rename...", (s, e) => RenameAfsEntry());
+            Any("Remove (all selected)", (s, e) => RemoveAfsEntry());
             m.Items.Add(new ToolStripSeparator());
+            m.Items.Add(Mi("Select all", (s, e) => SelectAllInList(lvAfs), Keys.None, "Ctrl+A"));
             m.Items.Add(Mi("Add file(s)...", (s, e) => AddAfsDlg()));
             m.Items.Add(Mi("Save AFS", (s, e) => SaveAfs(false)));
             m.Items.Add(Mi("Save AFS as...", (s, e) => SaveAfs(true)));
+
+            m.Opening += (s, e) =>
+            {
+                int n = lvAfs.SelectedIndices.Count;
+                foreach (var it in afsSingleItems) it.Enabled = n == 1;
+                foreach (var it in afsAnyItems) it.Enabled = n >= 1;
+            };
             return m;
         }
 
@@ -185,7 +203,26 @@ namespace PS2AudioStudio
             UpdateTitle();
         }
 
+        /// <summary>First selected entry index, or -1.</summary>
         private int SelAfs() => lvAfs.SelectedIndices.Count == 0 ? -1 : lvAfs.SelectedIndices[0];
+
+        /// <summary>All selected entry indices, ascending.</summary>
+        private List<int> SelAfsAll()
+        {
+            var l = new List<int>();
+            foreach (int i in lvAfs.SelectedIndices)
+                if (i >= 0 && i < afs.Entries.Count) l.Add(i);
+            l.Sort();
+            return l;
+        }
+
+        private void OnAfsSelectionChanged()
+        {
+            if (_listBulk) return;
+            int n = lvAfs.SelectedIndices.Count;
+            if (n == 1) PreviewSelectedAfs(false);
+            else if (n > 1) SetStatus($"{n} entries selected - Extract, Remove and drag-out act on all of them.");
+        }
 
         private void RefreshAfsRow(int i)
         {
@@ -301,19 +338,61 @@ namespace PS2AudioStudio
 
         // ================================================================= extract
 
+        /// <summary>Extracts the selected entries. One entry = save dialog, several = pick a folder.</summary>
         private void ExtractAfsEntry(bool asWav)
         {
-            int i = SelAfs(); if (i < 0) { SetStatus("Select an entry first."); return; }
-            var e = afs.Entries[i];
-            using var d = new SaveFileDialog { FileName = asWav ? Path.GetFileNameWithoutExtension(e.FileName) + ".wav" : AfsArchive.SafeName(e.FileName), AddExtension = true };
-            if (d.ShowDialog(this) != DialogResult.OK) return;
+            var sel = SelAfsAll();
+            if (sel.Count == 0) { SetStatus("Select an entry first."); return; }
+
+            if (sel.Count == 1)
+            {
+                var e = afs.Entries[sel[0]];
+                using var d = new SaveFileDialog { FileName = asWav ? Path.GetFileNameWithoutExtension(e.FileName) + ".wav" : AfsArchive.SafeName(e.FileName), AddExtension = true };
+                if (d.ShowDialog(this) != DialogResult.OK) return;
+                try
+                {
+                    if (asWav) StandardCodec.EncodeWav(AudioIO.Decode(e.Data, e.FileName), d.FileName);
+                    else File.WriteAllBytes(d.FileName, e.Data);
+                    SetStatus("Extracted: " + d.FileName);
+                }
+                catch (Exception ex) { MessageBox.Show(this, ex.Message, "Extract error"); }
+                return;
+            }
+
+            using var fd = new FolderBrowserDialog { Description = $"Extract the {sel.Count} selected entries to a folder" };
+            if (fd.ShowDialog(this) != DialogResult.OK) return;
+
+            int done = 0, failed = 0;
+            string firstError = null;
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            Cursor = Cursors.WaitCursor;
             try
             {
-                if (asWav) StandardCodec.EncodeWav(AudioIO.Decode(e.Data, e.FileName), d.FileName);
-                else File.WriteAllBytes(d.FileName, e.Data);
-                SetStatus("Extracted: " + d.FileName);
+                foreach (int idx in sel)
+                {
+                    var en = afs.Entries[idx];
+                    string n = SafeFile(AfsArchive.SafeName(en.FileName), "entry_" + idx);
+                    if (asWav) n = Path.GetFileNameWithoutExtension(n) + ".wav";
+                    if (!used.Add(n))
+                    {
+                        n = Path.GetFileNameWithoutExtension(n) + "_" + idx + Path.GetExtension(n);
+                        used.Add(n);
+                    }
+                    try
+                    {
+                        string target = Path.Combine(fd.SelectedPath, n);
+                        if (asWav) StandardCodec.EncodeWav(AudioIO.Decode(en.Data, en.FileName), target);
+                        else File.WriteAllBytes(target, en.Data);
+                        done++;
+                    }
+                    catch (Exception ex) { failed++; if (firstError == null) firstError = $"#{idx} {en.FileName}: {ex.Message}"; }
+                }
             }
-            catch (Exception ex) { MessageBox.Show(this, ex.Message, "Extract error"); }
+            finally { Cursor = Cursors.Default; }
+
+            SetStatus($"Extracted {done} of {sel.Count} entries to {fd.SelectedPath}" + (failed > 0 ? $" ({failed} failed)" : ""));
+            if (failed > 0)
+                MessageBox.Show(this, $"{failed} entr{(failed == 1 ? "y" : "ies")} could not be extracted" + (asWav ? " as WAV (not audio?)" : "") + ".\nFirst error:\n" + firstError, "Extract");
         }
 
         private void ExtractAllAfs()
@@ -401,12 +480,22 @@ namespace PS2AudioStudio
             SetStatus($"Added {paths.Length} file(s). Use Save AFS to write the archive.");
         }
 
+        /// <summary>Removes every selected entry.</summary>
         private void RemoveAfsEntry()
         {
-            int i = SelAfs(); if (i < 0) return;
-            if (MessageBox.Show(this, $"Remove entry #{i} ({afs.Entries[i].FileName}) from the archive?\n(Later entries shift down by one - game code that uses fixed indices may break.)", "Remove", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
-            afs.RemoveAt(i);
+            var sel = SelAfsAll();
+            if (sel.Count == 0) return;
+
+            string what = sel.Count == 1
+                ? $"entry #{sel[0]} ({afs.Entries[sel[0]].FileName})"
+                : $"{sel.Count} selected entries";
+            if (MessageBox.Show(this,
+                    $"Remove {what} from the archive?\n(Later entries shift down - game code that uses fixed indices may break.)",
+                    "Remove", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+
+            for (int k = sel.Count - 1; k >= 0; k--) afs.RemoveAt(sel[k]);
             PopulateAfs();
+            SetStatus($"Removed {sel.Count} entr{(sel.Count == 1 ? "y" : "ies")}. Use Save AFS to write the archive.");
         }
 
         private void RenameAfsEntry()
