@@ -16,6 +16,7 @@ namespace PS2AudioStudio.Audio
             private readonly int _end;
             private readonly bool _ignoreLoop;
             private volatile int _pos;
+            private bool _tail;     // started AFTER the loop end: play to the end of the track once, then wrap to the loop start
             public volatile float Volume = 1f;
 
             public WaveFormat WaveFormat { get; }
@@ -28,6 +29,10 @@ namespace PS2AudioStudio.Audio
                 _end = Math.Min(end, b.TotalFrames);
                 _ignoreLoop = ignoreLoop;
                 WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(b.SampleRate, b.Channels);
+
+                int ls0 = Math.Max(0, b.LoopStart);
+                int le0 = Math.Min(b.LoopEnd, b.TotalFrames);
+                _tail = !ignoreLoop && b.LoopEnabled && le0 > ls0 && _pos >= le0;
             }
 
             public int Read(float[] buffer, int offset, int count)
@@ -39,21 +44,25 @@ namespace PS2AudioStudio.Audio
 
                 while (written < framesWanted)
                 {
-                    // read the loop settings live, so dragging the flags while playing works
+                    // loop settings are read live, so dragging the flags while playing works
                     int ls = Math.Max(0, _b.LoopStart);
                     int le = Math.Min(_b.LoopEnd, maxFrames);
                     bool looping = !_ignoreLoop && _b.LoopEnabled && le > ls;
 
                     int limit;
                     if (looping)
-                        limit = _pos < le ? le : maxFrames;     // started after the loop end: play to the end, then wrap
+                    {
+                        if (_pos < le) { _tail = false; limit = le; }       // play up to the loop end
+                        else if (_tail) limit = maxFrames;                  // started after the loop end: play to the end once
+                        else { _pos = ls; continue; }                       // reached the loop end: jump back at once
+                    }
                     else
                         limit = Math.Min(_end, maxFrames);
 
                     if (_pos >= limit)
                     {
-                        if (looping) { _pos = ls; continue; }   // instant jump back to the loop start
-                        break;                                  // not looping: end of audio
+                        if (looping) { _pos = ls; _tail = false; continue; }   // end of track after a tail start: wrap
+                        break;                                                 // not looping: end of audio
                     }
 
                     int n = Math.Min(framesWanted - written, limit - _pos);
