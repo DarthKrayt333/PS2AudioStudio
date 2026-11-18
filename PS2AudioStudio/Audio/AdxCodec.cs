@@ -26,6 +26,8 @@ namespace PS2AudioStudio.Audio
     ///   cpyOff-2  "(c)CRI"
     ///   cpyOff+4  audio frames, channels interleaved per frame, then a 0x8001 end frame
     ///             (the size field = number of padding bytes after it; file is padded to a multiple of 0x800).
+    ///
+    /// Reading: version 3 and version 4 (CRI / HMAWL, loop block at 0x24) files are both understood - see AdxLoopInfo.
     /// </summary>
     public class AdxCodec : IAudioCodec
     {
@@ -59,7 +61,6 @@ namespace PS2AudioStudio.Audio
             int sr = BE32(d, 8);
             int total = BE32(d, 0x0C);
             int hpf = BE16(d, 0x10);
-            int version = d[0x12];
 
             if (enc != 3 && enc != 4)
                 throw new InvalidDataException($"Unsupported ADX encoding type {enc} (only 3 = standard and 4 = exponential are supported; AHX/fixed-coef are not).");
@@ -67,18 +68,14 @@ namespace PS2AudioStudio.Audio
                 throw new InvalidDataException("Corrupt ADX header.");
             if (dataOff > d.Length) throw new InvalidDataException("ADX data offset beyond end of file.");
 
+            // loop block: same reader as the AFS "Info" column, so both always agree
             int loopFlag = 0, loopStart = 0, loopEnd = 0;
-            if (version == 3 && dataOff >= 0x2C)
+            var li = AdxLoopInfo.Read(d);
+            if (li.HasLoop && li.StartSample >= 0 && li.EndSample <= int.MaxValue)
             {
-                loopFlag = BE32(d, 0x18);
-                loopStart = BE32(d, 0x1C);
-                loopEnd = BE32(d, 0x24);
-            }
-            else if (version == 4 && dataOff >= 0x38)
-            {
-                loopFlag = BE32(d, 0x28);
-                loopStart = BE32(d, 0x2C);
-                loopEnd = BE32(d, 0x34);
+                loopFlag = 1;
+                loopStart = (int)li.StartSample;
+                loopEnd = (int)li.EndSample;
             }
 
             Coeffs(hpf, sr, out int c1, out int c2);
