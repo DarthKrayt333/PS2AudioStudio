@@ -36,13 +36,14 @@ namespace PS2AudioStudio
         public static FlowLayoutPanel Bar1(int height = 38) =>
             new FlowLayoutPanel { Dock = DockStyle.Top, Height = height, BackColor = Bar, Padding = new Padding(3), WrapContents = false };
 
-        public static void StyleList(ListView lv)
+        /// <summary>Standard dark list. multi = true: Shift / Ctrl / drag-box multi-selection like Explorer.</summary>
+        public static void StyleList(ListView lv, bool multi = true)
         {
             lv.View = View.Details;
             lv.FullRowSelect = true;
             lv.HideSelection = false;
             lv.GridLines = true;
-            lv.MultiSelect = false;
+            lv.MultiSelect = multi;
             lv.BackColor = Panel;
             lv.ForeColor = Color.White;
             lv.Font = new Font("Consolas", 9);
