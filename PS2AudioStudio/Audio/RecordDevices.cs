@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using NAudio.CoreAudioApi;
 using NAudio.Wave;
@@ -63,16 +63,31 @@ namespace PS2AudioStudio.Audio
         private WaveFormat _fmt;
         private readonly List<float[]> _chunks = new List<float[]>();
         private readonly object _lock = new object();
+        private long _samples;   // total samples (all channels) captured so far
+        private float[] _viewArr;   // reused buffer for the live view
 
         public bool IsRecording { get; private set; }
         public int SampleRate => _fmt == null ? 0 : _fmt.SampleRate;
         /// <summary>Peak level 0..1 of each captured block (raised on the capture thread).</summary>
         public event Action<float> Level;
 
+        /// <summary>Number of frames captured so far (changes whenever new audio arrives).</summary>
+        public long FramesCaptured
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    int ch = _fmt == null ? 1 : Math.Max(1, _fmt.Channels);
+                    return _samples / ch;
+                }
+            }
+        }
+
         public void Start(RecordSourceKind kind, string deviceId)
         {
             if (IsRecording) return;
-            lock (_lock) _chunks.Clear();
+            lock (_lock) { _chunks.Clear(); _samples = 0; }
             _in = RecordDevices.Create(kind, deviceId);
             _fmt = _in.WaveFormat is WaveFormatExtensible x ? x.ToStandardWaveFormat() : _in.WaveFormat;
             _in.DataAvailable += OnData;
@@ -118,8 +133,87 @@ namespace PS2AudioStudio.Audio
 
             float peak = 0;
             for (int i = 0; i < f.Length; i++) { float a = Math.Abs(f[i]); if (a > peak) peak = a; }
-            lock (_lock) _chunks.Add(f);
+            lock (_lock) { _chunks.Add(f); _samples += f.Length; }
             Level?.Invoke(peak);
+        }
+
+        /// <summary>
+        /// Copy of the audio captured so far (only the last maxSeconds if maxSeconds &gt; 0).
+        /// Safe to call while recording. Returns null if nothing has arrived yet.
+        /// </summary>
+        public AudioBuffer Snapshot(double maxSeconds)
+        {
+            if (_fmt == null) return null;
+            int ch = Math.Max(1, _fmt.Channels);
+            float[] all;
+            lock (_lock)
+            {
+                long total = 0;
+                foreach (var c in _chunks) total += c.Length;
+                if (total == 0) return null;
+
+                long want = total;
+                if (maxSeconds > 0)
+                {
+                    long cap = (long)(maxSeconds * _fmt.SampleRate) * ch;
+                    if (cap > 0 && want > cap) want = cap;
+                }
+                all = new float[want];
+                long skip = total - want;
+                int o = 0;
+                foreach (var c in _chunks)
+                {
+                    if (skip >= c.Length) { skip -= c.Length; continue; }
+                    int from = (int)skip; skip = 0;
+                    int n = c.Length - from;
+                    Array.Copy(c, from, all, o, n);
+                    o += n;
+                }
+            }
+            var buf = new AudioBuffer(all, _fmt.SampleRate, ch);
+            if (ch > 2) buf = buf.ToChannels(2);
+            return buf;
+        }
+
+        /// <summary>
+        /// Live view: the newest leftSeconds of audio, followed by silence, padded to totalSeconds.
+        /// lineFrame = where the newest sample is. Safe to call while recording.
+        /// </summary>
+        public AudioBuffer SnapshotView(double leftSeconds, double totalSeconds, out int lineFrame)
+        {
+            lineFrame = 0;
+            if (_fmt == null) return null;
+            int ch = Math.Max(1, _fmt.Channels);
+            int rate = _fmt.SampleRate;
+            int totalFrames = (int)(totalSeconds * rate);
+            int leftFrames = (int)(leftSeconds * rate);
+            if (totalFrames <= 0) return null;
+
+            if (_viewArr == null || _viewArr.Length != totalFrames * ch) _viewArr = new float[totalFrames * ch];
+            else Array.Clear(_viewArr, 0, _viewArr.Length);
+
+            lock (_lock)
+            {
+                if (_samples == 0) return null;
+                long recFrames = _samples / ch;
+                int take = (int)Math.Min(recFrames, leftFrames);
+                long skipS = (recFrames - take) * ch;
+                int need = take * ch;
+                int o = 0;
+                foreach (var c in _chunks)
+                {
+                    if (o >= need) break;
+                    if (skipS >= c.Length) { skipS -= c.Length; continue; }
+                    int from = (int)skipS; skipS = 0;
+                    int n = Math.Min(c.Length - from, need - o);
+                    Array.Copy(c, from, _viewArr, o, n);
+                    o += n;
+                }
+                lineFrame = take;
+            }
+            var buf = new AudioBuffer(_viewArr, rate, ch);
+            if (ch > 2) buf = buf.ToChannels(2);
+            return buf;
         }
 
         public AudioBuffer Stop()
@@ -139,6 +233,9 @@ namespace PS2AudioStudio.Audio
                 int o = 0;
                 foreach (var c in _chunks) { Array.Copy(c, 0, all, o, c.Length); o += c.Length; }
                 _chunks.Clear();
+                _samples = 0;
+
+                _viewArr = null;
             }
             int ch = Math.Max(1, _fmt.Channels);
             var buf = new AudioBuffer(all, _fmt.SampleRate, ch);
