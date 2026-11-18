@@ -113,20 +113,32 @@ namespace PS2AudioStudio.Archives
 
         // =========================================================== load
 
-        public void LoadHD(string hdPath, string bdPath = null)
+        private static void CheckHd(byte[] h)
         {
-            byte[] h = File.ReadAllBytes(hdPath);
-            if (h.Length < 0x40) throw new InvalidDataException("HD file too small.");
+            if (h == null || h.Length < 0x40) throw new InvalidDataException("HD file too small.");
             string magic = Encoding.ASCII.GetString(h, 0, 8);
             if (magic != "IECSsreV")
                 throw new InvalidDataException($"Not a SCEI HD file (expected 'IECSsreV', got '{magic}').");
+        }
+
+        public void LoadHD(string hdPath, string bdPath = null)
+        {
+            byte[] h0 = File.ReadAllBytes(hdPath);
+            CheckHd(h0);
 
             if (bdPath == null) bdPath = FindBdFor(hdPath);
             if (bdPath == null || !File.Exists(bdPath))
                 throw new BdNotFoundException(hdPath,
                     $"Cannot find the BD body file next to the HD.\nLooked for {Path.GetFileNameWithoutExtension(hdPath)}.bd / .BD / .bin");
 
-            byte[] bd = File.ReadAllBytes(bdPath);
+            LoadFromBytes(h0, File.ReadAllBytes(bdPath), hdPath, bdPath);
+        }
+
+        /// <summary>Loads a bank from memory (used for the files inside a .psf2). The paths are only names.</summary>
+        public void LoadFromBytes(byte[] h, byte[] bd, string hdPath, string bdPath)
+        {
+            CheckHd(h);
+            if (bd == null) throw new InvalidDataException("BD data is missing.");
 
             int vers = (int)U32(h, 8);
             if (vers < 0x10 || vers > 0x100) vers = 0x10;
