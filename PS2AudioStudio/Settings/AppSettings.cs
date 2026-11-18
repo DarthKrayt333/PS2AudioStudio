@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Text.Json;
 
@@ -9,14 +9,21 @@ namespace PS2AudioStudio
 
     public sealed class AppSettings
     {
-        private const int CurrentVersion = 3;
+        private const int CurrentVersion = 5;
 
         /// <summary>Settings file version. Older files get the newer defaults once (see Load).</summary>
         public int Version { get; set; } = 0;
 
-        public RecordSourceKind RecordKind { get; set; } = RecordSourceKind.Capture;
+        // default = PC / desktop audio (Windows default playback device)
+        public RecordSourceKind RecordKind { get; set; } = RecordSourceKind.Loopback;
         public string RecordDeviceId { get; set; } = "";       // empty = Windows default of that kind
         public string RecordDeviceName { get; set; } = "";
+
+        /// <summary>Recording sample rate in Hz. Default 48000. The recording is converted to this rate when it stops.</summary>
+        public int RecordRate { get; set; } = 48000;
+
+        /// <summary>Last rate picked in the Save dialog (0 = keep the original rate).</summary>
+        public int SaveRate { get; set; } = 0;
 
         // File > New: default = clear ALL tabs
         public NewProjectMode NewMode { get; set; } = NewProjectMode.AllTabs;
@@ -57,9 +64,22 @@ namespace PS2AudioStudio
                 // one-time migrations, each runs only for files older than that version
                 if (s.Version < 2) s.NewMode = NewProjectMode.AllTabs;   // File > New default = all tabs
                 if (s.Version < 3) s.AskSaveRate = true;                 // always ask for the sample rate by default
+                if (s.Version < 4)                                       // recording default = desktop audio
+                {
+                    s.RecordKind = RecordSourceKind.Loopback;
+                    s.RecordDeviceId = "";
+                    s.RecordDeviceName = "";
+                }
+                if (s.Version < 5)                                       // recording rate default = 48000
+                {
+                    s.RecordRate = 48000;
+                    s.SaveRate = 0;
+                }
                 s.Version = CurrentVersion;
                 s.Save();
             }
+            if (s.RecordRate < 1000 || s.RecordRate > 384000) s.RecordRate = 48000;
+            if (s.SaveRate != 0 && (s.SaveRate < 1000 || s.SaveRate > 384000)) s.SaveRate = 0;
             return s;
         }
 
