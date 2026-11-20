@@ -11,10 +11,11 @@ namespace PS2AudioStudio.Archives
         public int Index { get; set; }
         public uint Offset { get; set; }                 // offset in the ORIGINAL archive (informational)
         public uint Size => (uint)(Data?.Length ?? 0);
-        public string FileName { get; set; }
+        public string FileName { get; set; }             // may contain folders: sound/ok_adx/adx/bg18_01.adx
         public byte[] Data { get; set; }
         /// <summary>Raw 48-byte filename-table record (32 byte name, 16 byte date + size) or null.</summary>
         public byte[] NameRecord { get; set; }
+        public uint OrigSize { get; set; }               // size when the archive was read / last saved
         public bool Modified { get; set; }
         public FileKind Kind => AudioIO.Detect(Data, FileName);
     }
@@ -22,7 +23,7 @@ namespace PS2AudioStudio.Archives
     /// <summary>
     /// AFS archive reader / writer (DKZ-Studio style).
     ///   "AFS\0", u32 count, count * (u32 offset, u32 size), then (optionally) u32 nameTableOffset, u32 nameTableSize.
-    ///   Name table: count * 0x30 bytes = 32 byte name + u16 y,m,d,h,m,s + u32 size.
+    ///   Name table: count * 0x30 bytes = 32 byte name (may be a path, no terminator when exactly 32) + 16 bytes of date / other data.
     /// Files are 0x800 aligned.
     /// </summary>
     public class AfsArchive
@@ -33,6 +34,8 @@ namespace PS2AudioStudio.Archives
         public bool Modified { get; set; }
         public int DataStart { get; private set; } = 0x800;
         private bool _namePtrAtEnd;                       // pointer lives at dataStart-8 instead of right after the TOC
+
+        public const int NameBytesMax = 32;
 
         public void New()
         {
@@ -45,6 +48,11 @@ namespace PS2AudioStudio.Archives
         }
 
         private static uint U32(byte[] d, long o) => BitConverter.ToUInt32(d, (int)o);
+
+        public static byte[] NameToBytes(string name)
+        {
+            return Encoding.Latin1.GetBytes(name ?? "");
+        }
 
         public void Open(string filePath)
         {
@@ -100,13 +108,13 @@ namespace PS2AudioStudio.Archives
                     rec = new byte[0x30];
                     Array.Copy(data, nameOff + i * 0x30L, rec, 0, 0x30);
                     int n = 0;
-                    while (n < 32 && rec[n] != 0) n++;
-                    if (n > 0) name = Encoding.ASCII.GetString(rec, 0, n);
+                    while (n < NameBytesMax && rec[n] != 0) n++;
+                    if (n > 0) name = Encoding.Latin1.GetString(rec, 0, n);
                 }
                 if (string.IsNullOrWhiteSpace(name))
                     name = $"{i:D4}" + AudioIO.ExtensionFor(AudioIO.Detect(fd, null));
 
-                Entries.Add(new AfsEntry { Index = i, Offset = offs[i], FileName = name, Data = fd, NameRecord = rec });
+                Entries.Add(new AfsEntry { Index = i, Offset = offs[i], FileName = name, Data = fd, NameRecord = rec, OrigSize = (uint)fd.Length });
             }
 
             HasNames = nameOff >= 0;
@@ -119,6 +127,18 @@ namespace PS2AudioStudio.Archives
         public void Save(string filePath)
         {
             int count = Entries.Count;
+
+            // names are stored in 32 bytes: refuse to cut them silently
+            if (HasNames)
+            {
+                for (int i = 0; i < count; i++)
+                {
+                    int len = NameToBytes(Entries[i].FileName).Length;
+                    if (len > NameBytesMax)
+                        throw new InvalidDataException($"The name of entry #{i} is {len} bytes long, but the AFS name table only holds {NameBytesMax}:\n{Entries[i].FileName}\n\nRename it (shorter) and save again.");
+                }
+            }
+
             long headerSize = 8 + count * 8L + (HasNames ? 8 : 0);
             long minStart = (headerSize + 0x7FF) / 0x800 * 0x800;
             long dataStart = Math.Max(DataStart, minStart);
@@ -167,7 +187,8 @@ namespace PS2AudioStudio.Archives
                     {
                         var e = Entries[i];
                         byte[] rec = new byte[0x30];
-                        if (e.NameRecord != null && e.NameRecord.Length >= 0x30) Array.Copy(e.NameRecord, rec, 0x30);
+                        bool hadRecord = e.NameRecord != null && e.NameRecord.Length >= 0x30;
+                        if (hadRecord) Array.Copy(e.NameRecord, rec, 0x30);
                         else
                         {
                             var now = DateTime.Now;
@@ -179,9 +200,15 @@ namespace PS2AudioStudio.Archives
                             Array.Copy(BitConverter.GetBytes((ushort)now.Second), 0, rec, 42, 2);
                         }
                         Array.Clear(rec, 0, 32);
-                        byte[] nb = Encoding.ASCII.GetBytes(e.FileName ?? "");
-                        Array.Copy(nb, rec, Math.Min(31, nb.Length));
-                        Array.Copy(BitConverter.GetBytes((uint)e.Data.Length), 0, rec, 44, 4);
+                        byte[] nb = NameToBytes(e.FileName);
+                        Array.Copy(nb, rec, Math.Min(NameBytesMax, nb.Length));
+
+                        // the last 4 bytes are only updated when they really were this entry's size
+                        // (in some archives they hold other data and must stay untouched)
+                        bool keepField = hadRecord && BitConverter.ToUInt32(rec, 44) != e.OrigSize;
+                        if (!keepField)
+                            Array.Copy(BitConverter.GetBytes((uint)e.Data.Length), 0, rec, 44, 4);
+
                         e.NameRecord = rec;
                         bw.Write(rec);
                     }
@@ -192,20 +219,65 @@ namespace PS2AudioStudio.Archives
             if (File.Exists(filePath)) File.Delete(filePath);
             File.Move(tmp, filePath);
 
-            for (int i = 0; i < count; i++) { Entries[i].Offset = (uint)offsets[i]; Entries[i].Index = i; Entries[i].Modified = false; }
+            for (int i = 0; i < count; i++)
+            {
+                Entries[i].Offset = (uint)offsets[i];
+                Entries[i].Index = i;
+                Entries[i].Modified = false;
+                Entries[i].OrigSize = (uint)Entries[i].Data.Length;
+            }
             DataStart = (int)dataStart;
             Path = filePath;
             Modified = false;
         }
 
-        public void ExtractAll(string outputDir)
+        // ================================================================= names / folders
+        /// <summary>"sound/ok_adx/adx/a.adx" -> "sound\ok_adx\adx\a.adx" with every part made safe for Windows.</summary>
+        public static string SafeRelativePath(string name)
+        {
+            var parts = new List<string>();
+            foreach (var raw in (name ?? "").Replace('\\', '/').Split('/'))
+            {
+                string s = raw.Trim();
+                if (s.Length == 0 || s == "." || s == "..") continue;
+                foreach (char c in System.IO.Path.GetInvalidFileNameChars()) s = s.Replace(c, '_');
+                parts.Add(s);
+            }
+            return parts.Count == 0 ? "unnamed" : System.IO.Path.Combine(parts.ToArray());
+        }
+
+        /// <summary>Only the file name without its folders: "sound/ok_adx/adx/a.adx" -> "a.adx".</summary>
+        public static string LeafName(string name)
+        {
+            return System.IO.Path.GetFileName(SafeRelativePath(name));
+        }
+
+        public static bool HasFolder(string name)
+        {
+            return name != null && name.IndexOfAny(new[] { '/', '\\' }) >= 0;
+        }
+
+        /// <summary>Extracts everything. With keepFolders the folders stored in the names are recreated. Returns the file count.</summary>
+        public int ExtractAll(string outputDir, bool keepFolders = true)
         {
             Directory.CreateDirectory(outputDir);
+            var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            int n = 0;
             foreach (var e in Entries)
             {
-                string name = SafeName(e.FileName);
-                File.WriteAllBytes(System.IO.Path.Combine(outputDir, name), e.Data);
+                string rel = keepFolders ? SafeRelativePath(e.FileName) : LeafName(e.FileName);
+                if (!used.Add(rel))
+                {
+                    string dir = System.IO.Path.GetDirectoryName(rel) ?? "";
+                    rel = System.IO.Path.Combine(dir, System.IO.Path.GetFileNameWithoutExtension(rel) + "_" + e.Index + System.IO.Path.GetExtension(rel));
+                    used.Add(rel);
+                }
+                string full = System.IO.Path.Combine(outputDir, rel);
+                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(full));
+                File.WriteAllBytes(full, e.Data);
+                n++;
             }
+            return n;
         }
 
         public static string SafeName(string n)
@@ -223,7 +295,7 @@ namespace PS2AudioStudio.Archives
 
         public AfsEntry Add(string name, byte[] data)
         {
-            var e = new AfsEntry { Index = Entries.Count, FileName = name, Data = data, Modified = true };
+            var e = new AfsEntry { Index = Entries.Count, FileName = name, Data = data, Modified = true, OrigSize = (uint)data.Length };
             Entries.Add(e);
             Modified = true;
             return e;
