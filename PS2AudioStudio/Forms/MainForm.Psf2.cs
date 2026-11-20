@@ -42,6 +42,7 @@ namespace PS2AudioStudio
         private ComboBox cmbSong;
         private ProgressBar pbRender;
         private Button bPlaySong, bCancelRender;
+        private CheckBox chkPsf2Effects;
         private SplitContainer splitPsf2, splitPsf2Left;
         private CancellationTokenSource renderCts;
         private readonly List<ToolStripItem> sampleSingleItems = new List<ToolStripItem>();
@@ -54,10 +55,10 @@ namespace PS2AudioStudio
             // ---- row 1: bank ----
             var bar1 = Ui.Bar1(40);
             var bHd = Ui.Btn("📂 Load HD (+BD)..."); bHd.Click += (s, e) => LoadHdDlg();
-            var bSq = Ui.Btn("📂 Load SQ / MIDI..."); bSq.Click += (s, e) => LoadSqDlg();
+            var bSq = Ui.Btn("📂 Open MIDI / SQ / SEQ..."); bSq.Click += (s, e) => OpenSequenceDlg(false);
             var bNewSq = Ui.Btn("🆕 New SQ from MIDI..."); bNewSq.Click += (s, e) => NewSqFromMidi();
             var bSave = Ui.Btn("💾 Save HD + BD..."); bSave.Click += (s, e) => SaveBank(true);
-            var bExtAll = Ui.Btn("📁 Extract all VAG..."); bExtAll.Click += (s, e) => ExtractAllVag();
+            var bExtAll = Ui.Btn("📁 Extract all samples..."); bExtAll.Click += (s, e) => ExtractAllVag();
             var bPlaySel = Ui.Btn("▶ Play sample"); bPlaySel.Click += (s, e) => PlaySelectedSample();
             bar1.Controls.AddRange(new Control[] { bHd, bSq, bNewSq, bSave, bExtAll, bPlaySel });
 
@@ -93,8 +94,11 @@ namespace PS2AudioStudio
             var bShowFull = Ui.Btn("🎼 Show full song"); bShowFull.Click += (s, e) => ShowFullSong();
             var bReport = Ui.Btn("📋 Render report..."); bReport.Click += (s, e) => ShowRenderReport();
             var bSaveSong = Ui.Btn("💾 Save song as MIDI / SQ..."); bSaveSong.Click += (s, e) => SaveSelectedSongAs();
+
+            chkPsf2Effects = new CheckBox { Text = "Effects (PS1 reverb on wet samples)", Checked = true, AutoSize = true, ForeColor = Color.White, Margin = new Padding(14, 10, 2, 0) };
+            chkPsf2Effects.CheckedChanged += (s, e) => OnPsf2EffectsChanged();
             bar4.Controls.Add(Ui.Lbl("Song tools:"));
-            bar4.Controls.AddRange(new Control[] { bMidiPlay, bMidiStop, bShowFull, bReport, bSaveSong });
+            bar4.Controls.AddRange(new Control[] { bMidiPlay, bMidiStop, bShowFull, bReport, bSaveSong, chkPsf2Effects });
 
             // ---- row 5: .psf2 packages ----
             var bar5 = Ui.Bar1(40);
@@ -187,25 +191,25 @@ namespace PS2AudioStudio
         {
             var m = Ui.Ctx();
             ToolStripItem S(ToolStripItem it) { sampleSingleItems.Add(it); return it; }
-
             m.Items.Add(S(Mi("▶ Play", (s, e) => PlaySelectedSample())));
             m.Items.Add(S(Mi("Open in Audio Editor", (s, e) => { int i = SelectedSampleIndex(); if (i >= 0) SendSampleToEditor(i); })));
             m.Items.Add(new ToolStripSeparator());
             m.Items.Add(Mi("Extract as .vag (lossless)...", (s, e) => ExtractSample(false)));
             m.Items.Add(Mi("Extract as .wav...", (s, e) => ExtractSample(true)));
             m.Items.Add(new ToolStripSeparator());
-            m.Items.Add(S(Mi("Replace with file... (keep original sample rate)", (s, e) => ReplaceSelectedFromDialog(true))));
-            m.Items.Add(S(Mi("Replace with file... (use the file's sample rate)", (s, e) => ReplaceSelectedFromDialog(false))));
-            m.Items.Add(S(Mi("Replace with Audio Editor contents (keep rate)", (s, e) => { int i = SelectedSampleIndex(); if (i >= 0) ReplaceSampleFromEditor(i, true); })));
-            m.Items.Add(S(Mi("Replace with Audio Editor contents (editor's rate)", (s, e) => { int i = SelectedSampleIndex(); if (i >= 0) ReplaceSampleFromEditor(i, false); })));
+            m.Items.Add(S(Mi("Replace with file...", (s, e) => ReplaceSelectedFromDialog(false))));
+            var bulk = Mi("Replace the selected samples with several files (by file name order)...", (s, e) => ReplaceSelectedByNameOrder());
+            m.Items.Add(bulk);
+            m.Items.Add(S(Mi("Replace with Audio Editor contents", (s, e) => { int i = SelectedSampleIndex(); if (i >= 0) ReplaceSampleFromEditor(i, false); })));
             m.Items.Add(Mi("Revert selected sample(s)", (s, e) => RevertSelected()));
             m.Items.Add(new ToolStripSeparator());
             m.Items.Add(Mi("Select all", (s, e) => SelectAllInList(lvSamples)));
             m.Items.Add(Mi("Save HD + BD...", (s, e) => SaveBank(true)));
             m.Opening += (s, e) =>
             {
-                bool one = lvSamples.SelectedItems.Count == 1;
-                foreach (var it in sampleSingleItems) it.Enabled = one;
+                int sel = lvSamples.SelectedItems.Count;
+                foreach (var it in sampleSingleItems) it.Enabled = sel == 1;
+                bulk.Enabled = sel > 1;
             };
             return m;
         }
@@ -214,6 +218,18 @@ namespace PS2AudioStudio
         {
             renderCache.Clear();
             reportCache.Clear();
+        }
+
+        /// <summary>Effects checkbox of the PSF2 tab: the cached renders are stale, the next Play song renders again.</summary>
+        private void OnPsf2EffectsChanged()
+        {
+            renderCts?.Cancel();
+            TransportStop();
+            InvalidateRenders();
+            ShowSongInfo();
+            SetStatus(chkPsf2Effects.Checked
+                ? "Effects ON: press Play song - wet samples (HD byte 41) get the PS1 reverb."
+                : "Effects OFF: press Play song - dry render.");
         }
 
         private void ClearPsf2Tab()
@@ -366,6 +382,8 @@ namespace PS2AudioStudio
             psf2Template = null; psf2Name = null;
             ApplyBank(nb);
             SetStatus($"Loaded {Path.GetFileName(bank.HdPath)} + {Path.GetFileName(bank.BdPath)}.");
+
+            OfferSequenceIfNone(false);
         }
 
         private void UpdateBankInfo()
@@ -592,8 +610,10 @@ namespace PS2AudioStudio
             try
             {
                 var b = bank; var token = cts.Token;
+                bool fx = chkPsf2Effects.Checked;
                 // full song (honorLoop = false): the SQ loop is put on the buffer as editable loop points
-                var result = await Task.Run(() => Psf2Renderer.Render(b, song, prog, token, false, report));
+                var result = await Task.Run(() => Psf2Renderer.Render(b, song, prog, token, false, report, fx));
+
                 ApplySongLoopToBuffer(result, song);
 
                 // mini hack: the preview IS the VAG (own rate, own loop points) - no padding, exactly like the game
@@ -809,12 +829,12 @@ namespace PS2AudioStudio
             SaveSongAs(song, SongBaseName(song), 1);
         }
 
-        /// <summary>filterIndex 1 = MIDI, 2 = SQ. The extension typed by the user decides the format.</summary>
+        /// <summary>filterIndex 1 = MIDI, 2 = SQ, 3 = PS1 SEQ. The extension typed by the user decides the format.</summary>
         private void SaveSongAs(SqSong song, string baseName, int filterIndex)
         {
             using var d = new SaveFileDialog
             {
-                Filter = "Standard MIDI (*.mid)|*.mid|SCEI SQ (*.sq)|*.sq",
+                Filter = "Standard MIDI (*.mid)|*.mid|SCEI SQ (*.sq)|*.sq|Sony PlayStation SEQ (*.seq)|*.seq",
                 FilterIndex = filterIndex,
                 FileName = baseName,
                 AddExtension = true
@@ -822,11 +842,13 @@ namespace PS2AudioStudio
             if (d.ShowDialog(this) != DialogResult.OK) return;
             try
             {
-                bool asSq = d.FileName.EndsWith(".sq", StringComparison.OrdinalIgnoreCase);
-                byte[] data = asSq ? SqFile.BuildNew(new List<SqSong> { song }, sq) : song.ToSmf();
+                string ext = Path.GetExtension(d.FileName).ToLowerInvariant();
+                byte[] data = ext == ".sq" ? SqFile.BuildNew(new List<SqSong> { song }, sq)
+                            : ext == ".seq" ? song.ToSeq()
+                            : song.ToSmf();
                 BackupOnce(d.FileName);
                 File.WriteAllBytes(d.FileName, data);
-                SetStatus((asSq ? "Saved SQ: " : "Saved MIDI: ") + d.FileName);
+                SetStatus((ext == ".sq" ? "Saved SQ: " : ext == ".seq" ? "Saved PS1 SEQ: " : "Saved MIDI: ") + d.FileName);
             }
             catch (Exception ex) { MessageBox.Show(this, ex.Message, "Save song", MessageBoxButtons.OK, MessageBoxIcon.Error); }
         }
@@ -849,11 +871,16 @@ namespace PS2AudioStudio
             var paths = pathsIn.Where(p => !string.IsNullOrEmpty(p) && File.Exists(p)).ToList();
             if (paths.Count == 0) return false;
 
+            if (HandleSequenceDrops(paths)) return true;
+
             string psf2 = paths.FirstOrDefault(p => string.Equals(Path.GetExtension(p), ".psf2", StringComparison.OrdinalIgnoreCase));
             if (psf2 != null) { OpenPsf2File(psf2); return true; }
 
             string sf2 = paths.FirstOrDefault(p => string.Equals(Path.GetExtension(p), ".sf2", StringComparison.OrdinalIgnoreCase));
             if (sf2 != null) { ImportSf2File(sf2); return true; }
+
+            string psfScan = paths.FirstOrDefault(p => { string e = Path.GetExtension(p).ToLowerInvariant(); return e == ".psf" || e == ".minipsf" || e == ".psflib" || e == ".vab" || e == ".seq"; });
+            if (psfScan != null) { OpenPsfFile(psfScan); return true; }
 
             bool IsMid(string p)
             {
@@ -1045,6 +1072,7 @@ namespace PS2AudioStudio
                 if (sq == null)
                 {
                     SetStatus($"Opened {Path.GetFileName(path)}: bank only (no .sq inside - a sound-effect bank).");
+                    OfferSequenceIfNone(false);
                     return;
                 }
 
@@ -1270,20 +1298,13 @@ namespace PS2AudioStudio
 
         private void ExtractAllVag()
         {
-            if (!bank.Loaded) { MessageBox.Show(this, "Load an HD first.", "Extract"); return; }
-            using var d = new FolderBrowserDialog { Description = "Extract every VAG sample of the bank into a folder" };
-            if (d.ShowDialog(this) != DialogResult.OK) return;
-            int n = 0;
-            foreach (var s in bank.Samples.Where(x => x.Valid))
-            {
-                File.WriteAllBytes(Path.Combine(d.SelectedPath, bank.SampleFileName(s.Index) + ".vag"), bank.ExtractVag(s.Index));
-                n++;
-            }
-            SetStatus($"Extracted {n} VAG files to {d.SelectedPath}");
+            ExtractAllSamples();
         }
 
         private void ReplaceSelectedFromDialog(bool keepRate)
         {
+            keepRate = false;
+
             int i = SelectedSampleIndex();
             if (i < 0) { SetStatus("Select a sample to replace first."); return; }
             using var d = new OpenFileDialog { Filter = AudioIO.AudioOnlyFilter, Title = $"Replace sample #{i} with..." };
@@ -1292,6 +1313,8 @@ namespace PS2AudioStudio
 
         private void ReplaceSampleFromFile(int i, string path, bool keepRate)
         {
+            keepRate = false;
+
             try
             {
                 byte[] data = File.ReadAllBytes(path);
@@ -1322,6 +1345,8 @@ namespace PS2AudioStudio
 
         private void ReplaceSampleFromEditor(int i, bool keepRate)
         {
+            keepRate = false;
+
             var b = wave.Buffer;
             if (b == null || b.TotalFrames == 0) { MessageBox.Show(this, "The Audio Editor is empty.", "Replace"); return; }
             try
