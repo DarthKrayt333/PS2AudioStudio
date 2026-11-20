@@ -38,6 +38,9 @@ namespace PS2AudioStudio.Controls
         private int _playPos = -1;
         private bool _selecting, _dragLS, _dragLE;
 
+        private int _lastDownTick;
+        private int _lastDownX = int.MinValue;
+
         // live recording view (see LiveBegin)
         private bool _live;
         private double _liveSec = 30.0;     // width of the visible window in seconds
@@ -805,17 +808,32 @@ namespace PS2AudioStudio.Controls
             int f = FrameAt(e.X);
             ContextFrame = f;
             if (e.Button != MouseButtons.Left) return;
-
             bool shift = (ModifierKeys & Keys.Shift) != 0;
             HitTest(e.X, e.Y, shift, out bool nearLoop, out double dLs, out double dLe,
                     out bool nearSel, out double dSs, out double dSe);
-
             if (nearLoop)
             {
                 if (dLs <= dLe) _dragLS = true; else _dragLE = true;
                 return;
             }
-
+            // double-click (not on a loop flag) = select the whole track
+            if (!shift)
+            {
+                int now = Environment.TickCount;
+                bool dbl = e.Clicks >= 2;
+                if (!dbl && _lastDownX != int.MinValue)
+                    dbl = unchecked(now - _lastDownTick) <= SystemInformation.DoubleClickTime
+                          && Math.Abs(e.X - _lastDownX) <= SystemInformation.DoubleClickSize.Width;
+                if (dbl)
+                {
+                    _lastDownX = int.MinValue;
+                    _selecting = false;
+                    SelectAll();
+                    return;
+                }
+                _lastDownTick = now;
+                _lastDownX = e.X;
+            }
             if (nearSel)
             {
                 // grab one edge of the existing selection: the other edge stays fixed, nothing changes until the mouse moves
@@ -825,7 +843,6 @@ namespace PS2AudioStudio.Controls
                 _selecting = true;
                 return;
             }
-
             _selecting = true;
             if (shift)
             {
@@ -934,6 +951,24 @@ namespace PS2AudioStudio.Controls
                 ClampView();
                 Invalidate();
             }
+        }
+
+        // ---- double-click = select the whole track ----
+        private System.Windows.Forms.Timer _dblTimer;
+
+        protected override void OnMouseDoubleClick(MouseEventArgs e)
+        {
+            base.OnMouseDoubleClick(e);
+            if (e.Button != MouseButtons.Left || _buf == null || _live) return;
+            if ((Control.ModifierKeys & Keys.Shift) == Keys.Shift) return;
+            SelectAll();                       // select now
+            if (_dblTimer == null)             // and again 80 ms later, in case other code clears it in between
+            {
+                _dblTimer = new System.Windows.Forms.Timer { Interval = 80 };
+                _dblTimer.Tick += (s, a) => { _dblTimer.Stop(); if (_buf != null && !_live) SelectAll(); };
+            }
+            _dblTimer.Stop();
+            _dblTimer.Start();
         }
     }
 }
