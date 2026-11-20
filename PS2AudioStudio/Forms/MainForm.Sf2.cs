@@ -26,7 +26,7 @@ namespace PS2AudioStudio
             return panel;
         }
 
-        private void ExportSf2()
+        private void ExportSf2(bool psfEffects = false)
         {
             if (bank == null || !bank.Loaded)
             {
@@ -49,7 +49,10 @@ namespace PS2AudioStudio
                 {
                     Cursor = Cursors.WaitCursor;
                     string report;
-                    var sf = Psf2ToSf2.Convert(bank, Path.GetFileNameWithoutExtension(dlg.FileName), out report);
+                    string sfName = Path.GetFileNameWithoutExtension(dlg.FileName);
+                    var sf = psfEffects
+                        ? Psf2ToSf2.Convert(bank, sfName, Sf2File.VgmTransReverbSend, out report)
+                        : Psf2ToSf2.Convert(bank, sfName, out report);
                     byte[] data = sf.Build();
                     if (File.Exists(dlg.FileName)) BackupOnce(dlg.FileName);
                     File.WriteAllBytes(dlg.FileName, data);
