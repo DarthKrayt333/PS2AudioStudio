@@ -54,6 +54,8 @@ namespace PS2AudioStudio.Archives
     {
         public int Index, VagIndex, VelLow, VelHigh, BaseNote, Detune, Panpot, Volume;
         public ushort Adsr1, Adsr2;
+        public int Fx;                                              // byte 41 of the 42-byte entry (reverb switch)
+        public bool Wet { get { return (Fx & 0x0C) != 0; } }        // 1F and 2F = wet, 03 and 23 = dry (the four values tested in game)
     }
 
     /// <summary>
@@ -249,7 +251,8 @@ namespace PS2AudioStudio.Archives
                         Panpot = d[p + 13],
                         Volume = d[p + 16],
                         Adsr1 = (ushort)U16(d, p + 18),
-                        Adsr2 = (ushort)U16(d, p + 20)
+                        Adsr2 = (ushort)U16(d, p + 20),
+                        Fx = (p + 41 < d.Length) ? d[p + 41] : 0
                     };
                 }
             }
@@ -321,6 +324,7 @@ namespace PS2AudioStudio.Archives
         /// <summary>Replace a sample by new audio. Looping is taken from the audio's LoopEnabled flag.</summary>
         public void ReplaceSample(int index, AudioBuffer src, bool keepOriginalRate)
         {
+            keepOriginalRate = false;
             var s = Samples[index];
             if (!s.Valid) throw new InvalidOperationException("This slot is empty (no data in BD) and cannot be replaced.");
 
