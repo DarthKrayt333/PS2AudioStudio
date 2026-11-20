@@ -29,6 +29,7 @@ namespace PS2AudioStudio
         public NewProjectMode NewMode { get; set; } = NewProjectMode.AllTabs;
         public bool NewClearEditor { get; set; } = true;       // used by Custom
         public bool NewClearPsf2 { get; set; } = true;
+        public bool NewClearPsf { get; set; } = true;          // PSF (PS1) tab, used by Custom
         public bool NewClearAfs { get; set; } = true;
 
         public bool PlayLoopedWhenChecked { get; set; } = true;
@@ -94,7 +95,7 @@ namespace PS2AudioStudio
             catch { }
         }
 
-        /// <summary>tab: 0 = Audio Editor, 1 = PSF2, 2 = AFS. The active tab is always cleared.</summary>
+        /// <summary>tab: 0 = Audio Editor, 1 = PSF2, 2 = AFS, 3 = PSF (PS1). The active tab is always cleared.</summary>
         public bool ShouldClear(int tab, int activeTab)
         {
             if (tab == activeTab) return true;
@@ -102,7 +103,8 @@ namespace PS2AudioStudio
             {
                 case NewProjectMode.AllTabs: return true;
                 case NewProjectMode.Custom:
-                    return (tab == 0 && NewClearEditor) || (tab == 1 && NewClearPsf2) || (tab == 2 && NewClearAfs);
+                    return (tab == 0 && NewClearEditor) || (tab == 1 && NewClearPsf2)
+                        || (tab == 2 && NewClearAfs) || (tab == 3 && NewClearPsf);
                 default: return false;
             }
         }
