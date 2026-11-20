@@ -13,10 +13,11 @@ namespace PS2AudioStudio
         private readonly Button btnRefresh = new Button { Text = "Refresh" };
         private readonly RatePicker pkRate = new RatePicker();
         private readonly RadioButton rbActive = new RadioButton { Text = "Only the active tab" };
-        private readonly RadioButton rbAll = new RadioButton { Text = "All tabs (Editor + PSF2 + AFS)  (default)" };
+        private readonly RadioButton rbAll = new RadioButton { Text = "All tabs (Editor + PSF2 + PSF + AFS)  (default)" };
         private readonly RadioButton rbCustom = new RadioButton { Text = "Choose which tabs:" };
         private readonly CheckBox ckEd = new CheckBox { Text = "Audio Editor" };
-        private readonly CheckBox ckPsf = new CheckBox { Text = "PSF2 Bank" };
+        private readonly CheckBox ckPsf2 = new CheckBox { Text = "PSF2 Bank" };
+        private readonly CheckBox ckPsf = new CheckBox { Text = "PSF (PS1)" };
         private readonly CheckBox ckAfs = new CheckBox { Text = "AFS Archive" };
         private readonly CheckBox ckLoop = new CheckBox { Text = "Play looped (by the loop points) when Loop is ticked" };
         private readonly CheckBox ckAsk = new CheckBox { Text = "Ask for the sample rate every time I save" };
@@ -61,10 +62,11 @@ namespace PS2AudioStudio
             rbActive.SetBounds(14, 24, 400, 22);
             rbAll.SetBounds(14, 48, 400, 22);
             rbCustom.SetBounds(14, 72, 400, 22);
-            ckEd.SetBounds(40, 98, 110, 22);
-            ckPsf.SetBounds(160, 98, 110, 22);
-            ckAfs.SetBounds(280, 98, 110, 22);
-            gNew.Controls.AddRange(new Control[] { rbActive, rbAll, rbCustom, ckEd, ckPsf, ckAfs });
+            ckEd.SetBounds(40, 98, 105, 22);
+            ckPsf2.SetBounds(150, 98, 105, 22);
+            ckPsf.SetBounds(260, 98, 110, 22);
+            ckAfs.SetBounds(375, 98, 120, 22);
+            gNew.Controls.AddRange(new Control[] { rbActive, rbAll, rbCustom, ckEd, ckPsf2, ckPsf, ckAfs });
 
             var gPlay = new GroupBox { Text = "Playback / saving", Left = 12, Top = 354, Width = 536, Height = 110 };
             ckLoop.SetBounds(14, 22, 500, 22);
@@ -108,7 +110,10 @@ namespace PS2AudioStudio
             rbActive.Checked = s.NewMode == NewProjectMode.ActiveTabOnly;
             rbAll.Checked = s.NewMode == NewProjectMode.AllTabs;
             rbCustom.Checked = s.NewMode == NewProjectMode.Custom;
-            ckEd.Checked = s.NewClearEditor; ckPsf.Checked = s.NewClearPsf2; ckAfs.Checked = s.NewClearAfs;
+            ckEd.Checked = s.NewClearEditor;
+            ckPsf2.Checked = s.NewClearPsf2;
+            ckPsf.Checked = s.NewClearPsf;
+            ckAfs.Checked = s.NewClearAfs;
             ckLoop.Checked = s.PlayLoopedWhenChecked;
             ckAsk.Checked = s.AskSaveRate;
             ckBak.Checked = s.MakeBackups;
@@ -116,7 +121,7 @@ namespace PS2AudioStudio
             UpdateCustom();
         }
 
-        private void UpdateCustom() { ckEd.Enabled = ckPsf.Enabled = ckAfs.Enabled = rbCustom.Checked; }
+        private void UpdateCustom() { ckEd.Enabled = ckPsf2.Enabled = ckPsf.Enabled = ckAfs.Enabled = rbCustom.Checked; }
 
         private void Apply()
         {
@@ -124,7 +129,10 @@ namespace PS2AudioStudio
             if (cbDev.SelectedItem is RecordDevice d) { s.RecordKind = d.Kind; s.RecordDeviceId = d.Id; s.RecordDeviceName = d.Name; }
             s.RecordRate = pkRate.Value;
             s.NewMode = rbAll.Checked ? NewProjectMode.AllTabs : rbCustom.Checked ? NewProjectMode.Custom : NewProjectMode.ActiveTabOnly;
-            s.NewClearEditor = ckEd.Checked; s.NewClearPsf2 = ckPsf.Checked; s.NewClearAfs = ckAfs.Checked;
+            s.NewClearEditor = ckEd.Checked;
+            s.NewClearPsf2 = ckPsf2.Checked;
+            s.NewClearPsf = ckPsf.Checked;
+            s.NewClearAfs = ckAfs.Checked;
             s.PlayLoopedWhenChecked = ckLoop.Checked;
             s.AskSaveRate = ckAsk.Checked;
             s.MakeBackups = ckBak.Checked;
