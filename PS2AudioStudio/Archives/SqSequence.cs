@@ -148,33 +148,70 @@ namespace PS2AudioStudio.Archives
         public int NoteCount => Events.Count(e => e.Type == SqEventType.NoteOn);
         public IEnumerable<int> Channels => Events.Where(e => e.Type == SqEventType.NoteOn).Select(e => (int)e.Channel).Distinct().OrderBy(x => x);
 
+        /// <summary>Writes the loop markers the way the game's own .sq files do (checked against BGM_FRM.sq):
+        /// start = CC99 0, then CC6 1 one tick later; end = CC99 1, then CC6 1 one tick later, then CC38 0 one more tick later.
+        /// Takes the CC99 start/end events already in the song and replaces them. Returns false if there are none.</summary>
+        public bool AddSonyLoopData()
+        {
+            int si = -1, ei = -1;
+            for (int i = 0; i < Events.Count; i++)
+            {
+                SqEvent e = Events[i];
+                if (e.Type != SqEventType.Cc || e.A != 99) continue;
+                if (e.B == 0) { if (si < 0) si = i; }
+                else if (e.B == 1 || e.B == 127) { if (ei < 0) ei = i; }
+            }
+            if (si < 0 || ei < 0) return false;
+            long tStart = Events[si].Tick;
+            long tEnd = Events[ei].Tick;
+            Events.RemoveAt(Math.Max(si, ei));
+            Events.RemoveAt(Math.Min(si, ei));
+            // note-offs just behind the end marker would be skipped by the jump: put the marker behind them (real file: marker after the last note-off)
+            long lastOff = tEnd;
+            for (int i = 0; i < Events.Count; i++)
+                if (Events[i].Type == SqEventType.NoteOff && Events[i].Tick > lastOff && Events[i].Tick <= tEnd + 48) lastOff = Events[i].Tick;
+            tEnd = lastOff;
+            // before the note-ons of that tick (after note-offs / controllers)
+            int PosStart(long t)
+            {
+                int i = 0;
+                while (i < Events.Count && (Events[i].Tick < t || (Events[i].Tick == t && Events[i].Type != SqEventType.NoteOn))) i++;
+                return i;
+            }
+            // after everything up to and including that tick
+            int PosAfter(long t)
+            {
+                int i = 0;
+                while (i < Events.Count && Events[i].Tick <= t) i++;
+                return i;
+            }
+            Events.Insert(PosStart(tStart), new SqEvent { Tick = tStart, Type = SqEventType.Cc, Channel = 0, A = 99, B = 0 });
+            Events.Insert(PosAfter(tStart + 1), new SqEvent { Tick = tStart + 1, Type = SqEventType.Cc, Channel = 0, A = 6, B = 1 });
+            Events.Insert(PosStart(tEnd), new SqEvent { Tick = tEnd, Type = SqEventType.Cc, Channel = 0, A = 99, B = 1 });
+            Events.Insert(PosAfter(tEnd + 1), new SqEvent { Tick = tEnd + 1, Type = SqEventType.Cc, Channel = 0, A = 6, B = 1 });
+            Events.Insert(PosAfter(tEnd + 2), new SqEvent { Tick = tEnd + 2, Type = SqEventType.Cc, Channel = 0, A = 38, B = 0 });
+            FindLoop();
+            return true;
+        }
+
         // ================================================================= standard MIDI export
         public byte[] ToSmf()
         {
+            // exact export: only the events that are in the song, nothing added
             using var track = new MemoryStream();
             long last = 0;
             int ppqn = Math.Max(1, Math.Min(32767, Ppqn));
-
-            if (!string.IsNullOrEmpty(Name)) WriteMeta(track, 0x03, Name);
-
-            bool hasTempo0 = Events.Any(e => e.Type == SqEventType.Tempo && e.Tick == 0);
-            if (!hasTempo0) { WriteVlq(track, 0); track.Write(new byte[] { 0xFF, 0x51, 0x03, 0x07, 0xA1, 0x20 }, 0, 6); }
-
             foreach (var e in Events)
             {
                 long delta = Math.Max(0, e.Tick - last);
-                last = e.Tick;
+                last = Math.Max(last, e.Tick);
                 WriteVlq(track, delta);
                 int ch = e.Channel & 0x0F;
                 switch (e.Type)
                 {
                     case SqEventType.NoteOn: track.WriteByte((byte)(0x90 | ch)); track.WriteByte((byte)(e.A & 0x7F)); track.WriteByte((byte)Math.Max(1, e.B & 0x7F)); break;
                     case SqEventType.NoteOff: track.WriteByte((byte)(0x80 | ch)); track.WriteByte((byte)(e.A & 0x7F)); track.WriteByte(0x40); break;
-                    case SqEventType.Cc:
-                        track.WriteByte((byte)(0xB0 | ch)); track.WriteByte((byte)(e.A & 0x7F)); track.WriteByte((byte)(e.B & 0x7F));
-                        if (e.A == 99 && (e.B == 0 || e.B == 1 || e.B == 127))      // readable loop marker for DAWs (delta 0)
-                            WriteMeta(track, 0x06, e.B == 0 ? "loopStart" : "loopEnd");
-                        break;
+                    case SqEventType.Cc: track.WriteByte((byte)(0xB0 | ch)); track.WriteByte((byte)(e.A & 0x7F)); track.WriteByte((byte)(e.B & 0x7F)); break;
                     case SqEventType.Program: track.WriteByte((byte)(0xC0 | ch)); track.WriteByte((byte)(e.A & 0x7F)); break;
                     case SqEventType.PitchBend: track.WriteByte((byte)(0xE0 | ch)); track.WriteByte((byte)(e.A & 0x7F)); track.WriteByte((byte)(e.B & 0x7F)); break;
                     case SqEventType.Tempo:
@@ -185,7 +222,6 @@ namespace PS2AudioStudio.Archives
             }
             WriteVlq(track, 0);
             track.Write(new byte[] { 0xFF, 0x2F, 0x00 }, 0, 3);
-
             using var ms = new MemoryStream();
             ms.Write(Encoding.ASCII.GetBytes("MThd"), 0, 4);
             WriteBE32(ms, 6); WriteBE16(ms, 0); WriteBE16(ms, 1); WriteBE16(ms, ppqn);
@@ -193,6 +229,119 @@ namespace PS2AudioStudio.Archives
             WriteBE32(ms, (int)track.Length);
             track.WriteTo(ms);
             return ms.ToArray();
+        }
+
+        // ============ Sony PS1/PS2 SEQ ("pQES") writer ============
+        // Layout: "pQES", u32 BE version=1, u16 BE resolution, 3 bytes tempo (us/quarter, BE),
+        // 1 byte time-sig numerator, 1 byte denominator (power of 2) = 15 bytes, then MIDI events, end FF 2F 00.
+        public byte[] ToSeq()
+        {
+            using var ms = new MemoryStream();
+            int ppqn = Math.Max(1, Math.Min(65535, Ppqn));
+            int tempo0 = 500000, firstTempo = -1;
+            for (int i = 0; i < Events.Count; i++)
+                if (Events[i].Type == SqEventType.Tempo && Events[i].Tempo > 0 && Events[i].Tick == 0)
+                { tempo0 = Math.Min(0xFFFFFF, Events[i].Tempo); firstTempo = i; break; }
+
+            ms.Write(Encoding.ASCII.GetBytes("pQES"), 0, 4);
+            WriteBE32(ms, 1);
+            WriteBE16(ms, ppqn);
+            ms.WriteByte((byte)(tempo0 >> 16)); ms.WriteByte((byte)(tempo0 >> 8)); ms.WriteByte((byte)tempo0);
+            ms.WriteByte(4); ms.WriteByte(2);                       // 4/4
+
+            long last = 0; int running = -1;
+            for (int i = 0; i < Events.Count; i++)
+            {
+                if (i == firstTempo) continue;                      // already in the header
+                var e = Events[i];
+                WriteVlq(ms, Math.Max(0, e.Tick - last));
+                last = Math.Max(last, e.Tick);
+                if (e.Type == SqEventType.Tempo)
+                {
+                    if (e.Tempo <= 0) { ms.WriteByte(0xFF); ms.WriteByte(0x51); ms.WriteByte(3); ms.WriteByte(0x07); ms.WriteByte(0xA1); ms.WriteByte(0x20); }
+                    else
+                    {
+                        ms.WriteByte(0xFF); ms.WriteByte(0x51); ms.WriteByte(3);
+                        ms.WriteByte((byte)(e.Tempo >> 16)); ms.WriteByte((byte)(e.Tempo >> 8)); ms.WriteByte((byte)e.Tempo);
+                    }
+                    running = -1;                                   // a meta event ends running status
+                    continue;
+                }
+                int ch = e.Channel & 0x0F, status; byte d1 = (byte)(e.A & 0x7F), d2 = 0; int n = 2;
+                switch (e.Type)
+                {
+                    case SqEventType.NoteOn: status = 0x90 | ch; d2 = (byte)Math.Max(1, e.B & 0x7F); break;
+                    case SqEventType.NoteOff: status = 0x90 | ch; d2 = 0; break;      // note-on vel 0 = note-off
+                    case SqEventType.Cc: status = 0xB0 | ch; d2 = (byte)(e.B & 0x7F); break;
+                    case SqEventType.Program: status = 0xC0 | ch; n = 1; break;
+                    case SqEventType.PitchBend: status = 0xE0 | ch; d2 = (byte)(e.B & 0x7F); break;
+                    default: continue;
+                }
+                if (status != running) ms.WriteByte((byte)status);
+                running = status;
+                ms.WriteByte(d1); if (n == 2) ms.WriteByte(d2);
+            }
+            WriteVlq(ms, 0);
+            ms.Write(new byte[] { 0xFF, 0x2F, 0x00 }, 0, 3);
+            return ms.ToArray();
+        }
+
+        // ============ Sony SEQ reader ============
+        public static SqSong FromSeq(byte[] d, int off, string name)
+        {
+            if (d == null || off < 0 || d.Length < off + 15 || d[off] != 'p' || d[off + 1] != 'Q' || d[off + 2] != 'E' || d[off + 3] != 'S')
+                throw new InvalidDataException("Not a Sony SEQ file ('pQES').");
+            int ppqn = BE16(d, off + 8); if (ppqn == 0) ppqn = 480;
+            int tempo0 = (d[off + 10] << 16) | (d[off + 11] << 8) | d[off + 12];
+            var song = new SqSong { Name = name, Ppqn = ppqn };
+            if (tempo0 > 0) song.Events.Add(new SqEvent { Tick = 0, Type = SqEventType.Tempo, Tempo = tempo0 });
+            int p = off + 15, end = d.Length, running = 0; long tick = 0;
+            while (p < end)
+            {
+                tick += ReadVlq(d, ref p);
+                if (p >= end) break;
+                int st = d[p];
+                if (st >= 0x80) { p++; if (st < 0xF0) running = st; }
+                else { st = running; if (st == 0) break; }
+                if (st == 0xFF)
+                {
+                    if (p >= end) break;
+                    byte type = d[p++]; int ml = (int)ReadVlq(d, ref p);
+                    if (type == 0x2F) break;
+                    if (type == 0x51 && ml == 3 && p + 3 <= end)
+                        song.Events.Add(new SqEvent { Tick = tick, Type = SqEventType.Tempo, Tempo = (d[p] << 16) | (d[p + 1] << 8) | d[p + 2] });
+                    p += ml; continue;
+                }
+                if (st == 0xF0 || st == 0xF7) { p += (int)ReadVlq(d, ref p); continue; }
+                int hi = st & 0xF0; byte c = (byte)(st & 0x0F);
+                int nData = (hi == 0xC0 || hi == 0xD0) ? 1 : 2;
+                if (p + nData > end) break;
+                byte a = d[p], b = nData == 2 ? d[p + 1] : (byte)0; p += nData;
+                switch (hi)
+                {
+                    case 0x80: song.Events.Add(new SqEvent { Tick = tick, Channel = c, A = a, Type = SqEventType.NoteOff }); break;
+                    case 0x90: song.Events.Add(new SqEvent { Tick = tick, Channel = c, A = a, B = b, Type = b > 0 ? SqEventType.NoteOn : SqEventType.NoteOff }); break;
+                    case 0xB0: song.Events.Add(new SqEvent { Tick = tick, Channel = c, A = a, B = b, Type = SqEventType.Cc }); break;
+                    case 0xC0: song.Events.Add(new SqEvent { Tick = tick, Channel = c, A = a, Type = SqEventType.Program }); break;
+                    case 0xE0: song.Events.Add(new SqEvent { Tick = tick, Channel = c, A = a, B = b, Type = SqEventType.PitchBend }); break;
+                }
+            }
+            song.FindLoop();
+            return song;
+        }
+
+        /// <summary>Opens .mid / .sq / .seq (anything with a known magic) as one song. Use this for "place MIDI / SQ / SEQ manually" and drag-and-drop.</summary>
+        public static SqSong LoadAny(byte[] d, string name, int songIndex = 0)
+        {
+            if (d.Length >= 4 && d[0] == 'M' && d[1] == 'T' && d[2] == 'h' && d[3] == 'd') return FromSmf(d, name);
+            if (d.Length >= 4 && d[0] == 'p' && d[1] == 'Q' && d[2] == 'E' && d[3] == 'S') return FromSeq(d, 0, name);
+            if (d.Length >= 4 && d[0] == 'I' && d[1] == 'E' && d[2] == 'C' && d[3] == 'S')
+            {
+                var f = new SqFile(); f.Parse(d);
+                var s = f.Songs[Math.Min(Math.Max(0, songIndex), f.Songs.Count - 1)];
+                s.Name = name; return s;
+            }
+            throw new InvalidDataException("Unknown sequence format (expected MIDI, SQ or SEQ).");
         }
 
         private static void WriteMeta(Stream s, byte type, string text)
@@ -214,13 +363,14 @@ namespace PS2AudioStudio.Archives
             int div = BE16(d, 12);
             if ((div & 0x8000) != 0) throw new InvalidDataException("SMPTE-timed MIDI files are not supported.");
             if (div == 0) div = 480;
-
             var song = new SqSong { Name = name, Ppqn = div };
             var all = new List<(SqEvent ev, int order)>();
+            var ports = new List<int>();                       // MIDI port (FF 21 prefix) of every entry in 'all'
             var markers = new List<(SqEvent ev, int order)>();
             int order = 0;
+            int port = 0;
+            void Add(SqEvent e) { all.Add((e, order++)); ports.Add(port); }
             int p = 8 + hdrLen;
-
             for (int t = 0; t < ntrks && p + 8 <= d.Length; t++)
             {
                 string id = Encoding.ASCII.GetString(d, p, 4);
@@ -228,7 +378,7 @@ namespace PS2AudioStudio.Archives
                 int s = p + 8, end = Math.Min(d.Length, s + len);
                 p = s + len;
                 if (id != "MTrk") { continue; }
-
+                port = 0;
                 long tick = 0; byte running = 0;
                 int q = s;
                 while (q < end)
@@ -238,14 +388,15 @@ namespace PS2AudioStudio.Archives
                     byte st = d[q];
                     if (st >= 0x80) { q++; if (st < 0xF0) running = st; }
                     else st = running;
-
                     if (st == 0xFF)
                     {
                         if (q >= end) break;
                         byte type = d[q++];
                         int ml = (int)ReadVlq(d, ref q);
-                        if (type == 0x51 && ml == 3 && q + 3 <= end)
-                            all.Add((new SqEvent { Tick = tick, Type = SqEventType.Tempo, Tempo = (d[q] << 16) | (d[q + 1] << 8) | d[q + 2] }, order++));
+                        if (type == 0x21 && ml == 1 && q < end)
+                            port = d[q];
+                        else if (type == 0x51 && ml == 3 && q + 3 <= end)
+                            Add(new SqEvent { Tick = tick, Type = SqEventType.Tempo, Tempo = (d[q] << 16) | (d[q + 1] << 8) | d[q + 2] });
                         else if (type == 0x06 && ml > 0 && q + ml <= end)
                         {
                             string txt = Encoding.ASCII.GetString(d, q, ml).Trim();
@@ -272,24 +423,52 @@ namespace PS2AudioStudio.Archives
                         switch (hi)
                         {
                             case 0x90:
-                                all.Add((new SqEvent { Tick = tick, Channel = ch, A = a, B = b, Type = b > 0 ? SqEventType.NoteOn : SqEventType.NoteOff }, order++)); break;
+                                Add(new SqEvent { Tick = tick, Channel = ch, A = a, B = b, Type = b > 0 ? SqEventType.NoteOn : SqEventType.NoteOff }); break;
                             case 0x80:
-                                all.Add((new SqEvent { Tick = tick, Channel = ch, A = a, Type = SqEventType.NoteOff }, order++)); break;
+                                Add(new SqEvent { Tick = tick, Channel = ch, A = a, Type = SqEventType.NoteOff }); break;
                             case 0xB0:
-                                all.Add((new SqEvent { Tick = tick, Channel = ch, A = a, B = b, Type = SqEventType.Cc }, order++)); break;
+                                Add(new SqEvent { Tick = tick, Channel = ch, A = a, B = b, Type = SqEventType.Cc }); break;
                             case 0xC0:
-                                all.Add((new SqEvent { Tick = tick, Channel = ch, A = a, Type = SqEventType.Program }, order++)); break;
+                                Add(new SqEvent { Tick = tick, Channel = ch, A = a, Type = SqEventType.Program }); break;
                             case 0xE0:
-                                all.Add((new SqEvent { Tick = tick, Channel = ch, A = a, B = b, Type = SqEventType.PitchBend }, order++)); break;
+                                Add(new SqEvent { Tick = tick, Channel = ch, A = a, B = b, Type = SqEventType.PitchBend }); break;
                         }
                     }
                 }
             }
-
+            // MIDI ports: port 1+ has its own 16 channels, our song model has 16. A port-1+ channel that port 0 already uses
+            // is moved to a free channel (channel 10 is chosen last), so two tracks never share a channel.
+            var used = new bool[16];
+            for (int i = 0; i < all.Count; i++)
+                if (ports[i] == 0 && all[i].ev.Type != SqEventType.Tempo) used[all[i].ev.Channel & 15] = true;
+            var map = new Dictionary<int, int>();              // key = port * 16 + channel
+            for (int i = 0; i < all.Count; i++)
+            {
+                if (ports[i] == 0 || all[i].ev.Type == SqEventType.Tempo) continue;
+                int ch0 = all[i].ev.Channel & 15;
+                int key = ports[i] * 16 + ch0;
+                if (map.ContainsKey(key)) continue;
+                int target = ch0;
+                if (used[ch0])
+                {
+                    target = -1;
+                    for (int c = 0; c < 16; c++) if (c != 9 && !used[c]) { target = c; break; }
+                    if (target < 0 && !used[9]) target = 9;
+                    if (target < 0) target = ch0;              // all 16 channels taken: unavoidable
+                }
+                used[target] = true;
+                map[key] = target;
+            }
+            for (int i = 0; i < all.Count; i++)
+            {
+                if (ports[i] == 0 || all[i].ev.Type == SqEventType.Tempo) continue;
+                var tup = all[i];
+                tup.ev.Channel = (byte)map[ports[i] * 16 + (tup.ev.Channel & 15)];
+                all[i] = tup;
+            }
             // text markers only count when the file has no real CC#99 loop controllers
             bool hasCc99 = all.Any(x => x.ev.Type == SqEventType.Cc && x.ev.A == 99);
             if (!hasCc99) all.AddRange(markers);
-
             song.Events = all.OrderBy(x => x.ev.Tick).ThenBy(x => x.order).Select(x => x.ev).ToList();
             song.FindLoop();
             return song;
