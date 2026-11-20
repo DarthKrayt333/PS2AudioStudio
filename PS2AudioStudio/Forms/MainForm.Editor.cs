@@ -196,6 +196,12 @@ namespace PS2AudioStudio
             bool clrPs = cfg.ShouldClear(1, active);
             bool clrAf = cfg.ShouldClear(2, active);
 
+            // PSF tab: all tabs = yes; active tab only = only when you are on it; custom = follows the PSF2 tick for now
+            bool clrPf;
+            if (cfg.NewMode == NewProjectMode.AllTabs) clrPf = true;
+            else if (cfg.NewMode == NewProjectMode.ActiveTabOnly) clrPf = tabs.SelectedTab == tabPsf;
+            else clrPf = cfg.NewClearPsf;
+
             // the editor becomes a 5 second silent project only when it is the tab you are on; otherwise it is simply emptied
             bool silent = clrEd && active == 0;
             const double defaultSeconds = 5;
@@ -211,6 +217,7 @@ namespace PS2AudioStudio
             TransportStop();
             if (clrPs) ClearPsf2Tab();
             if (clrAf) ClearAfsTab();
+            if (clrPf) ClearPsfTab();
 
             if (clrEd)
             {
@@ -229,6 +236,7 @@ namespace PS2AudioStudio
             if (clrEd) parts.Add("Audio Editor");
             if (clrPs) parts.Add("PSF2");
             if (clrAf) parts.Add("AFS");
+            if (clrPf) parts.Add("PSF");
             SetStatus("New: cleared " + string.Join(" + ", parts) + ".");
         }
 
