@@ -30,6 +30,7 @@ namespace PS2AudioStudio
         private byte[] lead = new byte[0];
         private long nextOrder = 1L << 40;
         private bool dirty;
+        private bool _bulk;
         private readonly AudioPlayer player = new AudioPlayer();
         private readonly List<KeyValuePair<SplitContainer, int>> splitters = new List<KeyValuePair<SplitContainer, int>>();
 
@@ -94,9 +95,10 @@ namespace PS2AudioStudio
         {
             var lv = new ListView { Dock = DockStyle.Fill };
             Ui.StyleList(lv);
-            lv.MultiSelect = false;
             for (int i = 0; i < names.Length; i++) lv.Columns.Add(names[i], widths[i]);
-            return lv;
+            lv.MultiSelect = true;      // Shift+click and Ctrl+click select several rows
+            lv.HideSelection = false;   // the selection stays visible when the list loses focus
+            return lv;                  // Ctrl+A is handled by ProcessCmdKey in this form
         }
 
         private static PropertyGrid MakeGrid()
@@ -254,13 +256,9 @@ namespace PS2AudioStudio
         private TabPage BuildParPage()
         {
             lvPar = MakeList(new[] { "#", "VAG", "Base note", "Vel", "ADSR1 ADSR2" }, new[] { 45, 70, 80, 70, 110 });
-            lvPar.SelectedIndexChanged += (s, e) =>
-            {
-                int i = SelIdx(lvPar);
-                pgPar.SelectedObject = (i >= 0 && hf.Params[i] != null) ? new SdParamView(hf.Params[i]) : null;
-            };
+            lvPar.SelectedIndexChanged += (s, e) => OnParSelect();
             pgPar = MakeGrid();
-            pgPar.PropertyValueChanged += (s, e) => { dirty = true; int i = SelIdx(lvPar); if (i >= 0) UpdateRow(lvPar, i, ParRow(i)); };
+            pgPar.PropertyValueChanged += (s, e) => { dirty = true; UpdateSelectedRows(lvPar, ParRow); };
             var bar = MakeBar(
                 B("➕ Add / copy selected", (s, e) => ParAdd(), 170),
                 B("🗑 Remove", (s, e) => { if (RemoveSel(hf.Params, lvPar)) RefreshPars(-1); }, 100),
@@ -268,24 +266,36 @@ namespace PS2AudioStudio
                 B("▼", (s, e) => { int j = MoveSel(hf.Params, lvPar, 1, RemapParams); if (j >= 0) RefreshPars(j); }, 44));
             return TwoPane("🎚 Sample params (SMPL)", lvPar, bar, pgPar, 520);
         }
+        private void OnParSelect()
+        {
+            if (_bulk) return;
+            var l = new List<object>();
+            foreach (int i in SelIdxs(lvPar))
+                if (i < hf.Params.Count && hf.Params[i] != null) l.Add(new SdParamView(hf.Params[i]));
+            pgPar.SelectedObjects = l.ToArray();
+        }
 
         // ---------------------------------------------------------------- sample sets page
         private TabPage BuildSetPage()
         {
             lvSet = MakeList(new[] { "#", "Velocity", "Params", "Param numbers" }, new[] { 45, 80, 60, 200 });
-            lvSet.SelectedIndexChanged += (s, e) =>
-            {
-                int i = SelIdx(lvSet);
-                pgSet.SelectedObject = (i >= 0 && hf.Sets[i] != null) ? new SdSetView(hf.Sets[i]) : null;
-            };
+            lvSet.SelectedIndexChanged += (s, e) => OnSetSelect();
             pgSet = MakeGrid();
-            pgSet.PropertyValueChanged += (s, e) => { dirty = true; int i = SelIdx(lvSet); if (i >= 0) UpdateRow(lvSet, i, SetRow(i)); };
+            pgSet.PropertyValueChanged += (s, e) => { dirty = true; UpdateSelectedRows(lvSet, SetRow); };
             var bar = MakeBar(
                 B("➕ Add / copy selected", (s, e) => SetAdd(), 170),
                 B("🗑 Remove", (s, e) => { if (RemoveSel(hf.Sets, lvSet)) RefreshSets(-1); }, 100),
                 B("▲", (s, e) => { int j = MoveSel(hf.Sets, lvSet, -1, RemapSets); if (j >= 0) RefreshSets(j); }, 44),
                 B("▼", (s, e) => { int j = MoveSel(hf.Sets, lvSet, 1, RemapSets); if (j >= 0) RefreshSets(j); }, 44));
             return TwoPane("📚 Sample sets (SSET)", lvSet, bar, pgSet, 520);
+        }
+        private void OnSetSelect()
+        {
+            if (_bulk) return;
+            var l = new List<object>();
+            foreach (int i in SelIdxs(lvSet))
+                if (i < hf.Sets.Count && hf.Sets[i] != null) l.Add(new SdSetView(hf.Sets[i]));
+            pgSet.SelectedObjects = l.ToArray();
         }
 
         // ---------------------------------------------------------------- programs page
@@ -300,8 +310,7 @@ namespace PS2AudioStudio
                 B("▲", (s, e) => { int j = MoveSel(hf.Programs, lvProg, -1, null); if (j >= 0) RefreshProgs(j); }, 44),
                 B("▼", (s, e) => { int j = MoveSel(hf.Programs, lvProg, 1, null); if (j >= 0) RefreshProgs(j); }, 44));
             pgProg = MakeGrid();
-            pgProg.PropertyValueChanged += (s, e) => { dirty = true; int i = SelIdx(lvProg); if (i >= 0) UpdateRow(lvProg, i, ProgRow(i)); };
-
+            pgProg.PropertyValueChanged += (s, e) => { dirty = true; UpdateSelectedRows(lvProg, ProgRow); };
             lvSplit = MakeList(new[] { "#", "Keys", "Sample set", "VAG(s)" }, new[] { 40, 110, 80, 90 });
             lvSplit.SelectedIndexChanged += (s, e) => OnSplitSelect();
             var sbar = MakeBar(
@@ -315,10 +324,11 @@ namespace PS2AudioStudio
             pgSplit.PropertyValueChanged += (s, e) =>
             {
                 dirty = true;
-                var p = SelProgram(); int j = SelIdx(lvSplit);
-                if (p != null && j >= 0) UpdateRow(lvSplit, j, SplitRow(p, j));
+                var p = SelProgram();
+                if (p == null) return;
+                foreach (int j in SelIdxs(lvSplit))
+                    if (j < p.Splits.Count) UpdateRow(lvSplit, j, SplitRow(p, j));
             };
-
             var tp = new TabPage("🎹 Programs / splits");
             var sc = new SplitContainer { Dock = DockStyle.Fill };
             sc.Panel1.Controls.Add(lvProg);
@@ -342,6 +352,43 @@ namespace PS2AudioStudio
         private void Status(string s) { lblStatus.Text = s; }
 
         private static int SelIdx(ListView lv) { return lv.SelectedIndices.Count > 0 ? lv.SelectedIndices[0] : -1; }
+
+        private static List<int> SelIdxs(ListView lv)
+        {
+            var l = new List<int>();
+            foreach (int i in lv.SelectedIndices) l.Add(i);
+            l.Sort();
+            return l;
+        }
+        private static void UpdateSelectedRows(ListView lv, Func<int, string[]> row)
+        {
+            foreach (int i in SelIdxs(lv)) UpdateRow(lv, i, row(i));
+        }
+        private void SelectAllRows(ListView lv)
+        {
+            if (lv.Items.Count == 0) return;
+            _bulk = true;
+            lv.BeginUpdate();
+            try { foreach (ListViewItem it in lv.Items) it.Selected = true; }
+            finally { lv.EndUpdate(); _bulk = false; }
+            if (lv == lvVag) OnVagSelect();
+            else if (lv == lvPar) OnParSelect();
+            else if (lv == lvSet) OnSetSelect();
+            else if (lv == lvProg) OnProgSelect();
+            else if (lv == lvSplit) OnSplitSelect();
+        }
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            if (keyData == (Keys.Control | Keys.A))
+            {
+                Control c = this;
+                while (c is ContainerControl && ((ContainerControl)c).ActiveControl != null)
+                    c = ((ContainerControl)c).ActiveControl;
+                var lv = c as ListView;
+                if (lv != null) { SelectAllRows(lv); return true; }
+            }
+            return base.ProcessCmdKey(ref msg, keyData);
+        }
 
         private static string NoteName(int n)
         {
@@ -379,16 +426,17 @@ namespace PS2AudioStudio
 
         private bool RemoveSel<T>(List<T> list, ListView lv) where T : class
         {
-            int i = SelIdx(lv);
-            if (i < 0 || i >= list.Count) return false;
-            list[i] = null;
+            bool any = false;
+            foreach (int i in SelIdxs(lv))
+                if (i < list.Count && list[i] != null) { list[i] = null; any = true; }
+            if (!any) return false;
             TrimTail(list);
             dirty = true;
             return true;
         }
-
         private int MoveSel<T>(List<T> list, ListView lv, int dir, Action<int, int> remap)
         {
+            if (lv.SelectedIndices.Count > 1) { Status("Select exactly one row to move it up or down."); return -1; }
             int i = SelIdx(lv), j = i + dir;
             if (i < 0 || j < 0 || j >= list.Count) return -1;
             T t = list[i]; list[i] = list[j]; list[j] = t;
@@ -598,6 +646,7 @@ namespace PS2AudioStudio
         // ================================================================= VAGs
         private void OnVagSelect()
         {
+            if (_bulk) return;
             var sel = lvVag.SelectedIndices.Cast<int>().ToList();
             long total = lead.Length;
             var seen = new HashSet<byte[]>();
@@ -704,6 +753,22 @@ namespace PS2AudioStudio
             if (bad.Count > 0)
                 MessageBox.Show(this, "These files could not be added:\n\n" + string.Join("\n", bad.Take(15)), "Add audio", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             Status(n + " VAG(s) added" + (last >= 0 ? " (last one is slot " + last + ")." : "."));
+        }
+
+        /// <summary>Used by the PSF2 tab (no window is shown): adds the files as new VAGs with their OWN sample rate
+        /// (empty slots first, then at the end) and returns the rebuilt HD + BD. Programs, sets and params are not touched.</summary>
+        public bool AppendFiles(IEnumerable<string> files, out byte[] hd, out byte[] bd, out string error, out List<string> bad, out List<int> slots)
+        {
+            bad = new List<string>();
+            slots = new List<int>();
+            foreach (string f in files)
+            {
+                try { slots.Add(PutNewVag(ReadAudioFile(f))); }
+                catch (Exception ex) { bad.Add(Path.GetFileName(f) + ": " + ex.Message); }
+            }
+            bool ok = TryBuild(out hd, out bd, out error);
+            try { player.Dispose(); } catch { }
+            return ok;
         }
 
         private void AddVags()
@@ -868,47 +933,62 @@ namespace PS2AudioStudio
 
         private void ParAdd()
         {
-            int src = SelIdx(lvPar);
-            byte[] raw = (src >= 0 && src < hf.Params.Count && hf.Params[src] != null) ? (byte[])hf.Params[src].Raw.Clone() : (byte[])TplParam.Clone();
-            int at = PutParam(new HdParam { Raw = raw });
+            var src = SelIdxs(lvPar).Where(k => k < hf.Params.Count && hf.Params[k] != null).ToList();
+            int at = -1;
+            if (src.Count == 0) at = PutParam(new HdParam { Raw = (byte[])TplParam.Clone() });
+            else foreach (int i in src) at = PutParam(new HdParam { Raw = (byte[])hf.Params[i].Raw.Clone() });
             RefreshPars(at);
-            Status("Sample param " + at + " added. Set its VAG number, base note and ADSR on the right.");
+            Status(Math.Max(1, src.Count) + " sample param(s) added (last one is " + at + "). Set the VAG number, base note and ADSR on the right.");
         }
-
         private void SetAdd()
         {
-            int src = SelIdx(lvSet);
-            var s = new HdSet();
-            if (src >= 0 && src < hf.Sets.Count && hf.Sets[src] != null)
+            var src = SelIdxs(lvSet).Where(k => k < hf.Sets.Count && hf.Sets[k] != null).ToList();
+            int at = -1;
+            if (src.Count == 0)
             {
-                var o = hf.Sets[src];
-                s.VelCurve = o.VelCurve; s.VelLow = o.VelLow; s.VelHigh = o.VelHigh; s.Params = new List<ushort>(o.Params);
+                var n = new HdSet();
+                n.Params.Add(0);
+                at = PutSet(n);
             }
-            else s.Params.Add(0);
-            int at = PutSet(s);
+            else
+            {
+                foreach (int i in src)
+                {
+                    var o = hf.Sets[i];
+                    var n = new HdSet { VelCurve = o.VelCurve, VelLow = o.VelLow, VelHigh = o.VelHigh, Params = new List<ushort>(o.Params) };
+                    at = PutSet(n);
+                }
+            }
             RefreshSets(at);
-            Status("Sample set " + at + " added. Type the sample param numbers it uses (e.g. 0, 1).");
+            Status(Math.Max(1, src.Count) + " sample set(s) added (last one is " + at + "). Type the sample param numbers it uses (e.g. 0, 1).");
         }
 
         // ================================================================= programs / splits
         private HdProgram SelProgram()
         {
-            int i = SelIdx(lvProg);
-            return (i >= 0 && i < hf.Programs.Count) ? hf.Programs[i] : null;
+            if (lvProg.SelectedIndices.Count != 1) return null;
+            int i = lvProg.SelectedIndices[0];
+            return (i < hf.Programs.Count) ? hf.Programs[i] : null;
         }
-
         private void OnProgSelect()
         {
-            var p = SelProgram();
-            pgProg.SelectedObject = p != null ? new SdProgView(p) : null;
-            pgSplit.SelectedObject = null;
+            if (_bulk) return;
+            var l = new List<object>();
+            foreach (int i in SelIdxs(lvProg))
+                if (i < hf.Programs.Count && hf.Programs[i] != null) l.Add(new SdProgView(hf.Programs[i]));
+            pgProg.SelectedObjects = l.ToArray();
+            pgSplit.SelectedObjects = new object[0];
             RefreshSplits(-1);
         }
-
         private void OnSplitSelect()
         {
-            var p = SelProgram(); int j = SelIdx(lvSplit);
-            pgSplit.SelectedObject = (p != null && j >= 0 && j < p.Splits.Count) ? new SdSplitView(p.Splits[j]) : null;
+            if (_bulk) return;
+            var p = SelProgram();
+            var l = new List<object>();
+            if (p != null)
+                foreach (int j in SelIdxs(lvSplit))
+                    if (j < p.Splits.Count) l.Add(new SdSplitView(p.Splits[j]));
+            pgSplit.SelectedObjects = l.ToArray();
         }
 
         private static HdProgram CloneProgram(HdProgram o)
@@ -980,8 +1060,29 @@ namespace PS2AudioStudio
 
         private void ProgCopy()
         {
-            var src = SelProgram();
-            if (src == null) { Status("Select a program to copy first."); return; }
+            var sel = SelIdxs(lvProg).Where(k => k < hf.Programs.Count && hf.Programs[k] != null).ToList();
+            if (sel.Count == 0) { Status("Select a program to copy first."); return; }
+            if (sel.Count > 1)
+            {
+                if (MessageBox.Show(this, "Copy " + sel.Count + " programs into the first free program numbers?", "PSF2 Studio",
+                        MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+                var made = new List<string>();
+                int lastAt = -1;
+                foreach (int k in sel)
+                {
+                    int at = hf.Programs.IndexOf(null);
+                    if (at < 0) { hf.Programs.Add(null); at = hf.Programs.Count - 1; }
+                    if (at > 2047) { Status("No free program number left (maximum 2047)."); break; }
+                    hf.Programs[at] = CloneProgram(hf.Programs[k]);
+                    made.Add(k + "→" + at);
+                    lastAt = at;
+                }
+                dirty = true;
+                RefreshProgs(lastAt);
+                Status("Copied (old→new): " + string.Join(", ", made.Take(20)) + (made.Count > 20 ? " ..." : ""));
+                return;
+            }
+            var src = hf.Programs[sel[0]];
             int def = hf.Programs.IndexOf(null);
             if (def < 0) def = hf.Programs.Count;
             double v;
@@ -995,16 +1096,26 @@ namespace PS2AudioStudio
             RefreshProgs(idx);
             Status("Program " + idx + " added (copy of the selected one; it shares its sample sets).");
         }
-
         private void SplitAdd()
         {
             var p = SelProgram();
-            if (p == null) { Status("Select a program first."); return; }
-            int j = SelIdx(lvSplit);
-            byte[] raw = (j >= 0 && j < p.Splits.Count) ? (byte[])p.Splits[j].Raw.Clone() : (byte[])TplSplit.Clone();
-            p.Splits.Add(new HdSplit { Raw = raw });
+            if (p == null) { Status("Select ONE program first."); return; }
+            var sel = SelIdxs(lvSplit).Where(k => k < p.Splits.Count).ToList();
+            if (sel.Count == 0) p.Splits.Add(new HdSplit { Raw = (byte[])TplSplit.Clone() });
+            else foreach (int k in sel) p.Splits.Add(new HdSplit { Raw = (byte[])p.Splits[k].Raw.Clone() });
             dirty = true;
             RefreshSplits(p.Splits.Count - 1);
+            UpdateRow(lvProg, SelIdx(lvProg), ProgRow(SelIdx(lvProg)));
+        }
+        private void SplitRemove()
+        {
+            var p = SelProgram();
+            var sel = SelIdxs(lvSplit);
+            if (p == null || sel.Count == 0) return;
+            for (int n = sel.Count - 1; n >= 0; n--)
+                if (sel[n] < p.Splits.Count) p.Splits.RemoveAt(sel[n]);
+            dirty = true;
+            RefreshSplits(Math.Min(sel[0], p.Splits.Count - 1));
             UpdateRow(lvProg, SelIdx(lvProg), ProgRow(SelIdx(lvProg)));
         }
 
@@ -1054,16 +1165,6 @@ namespace PS2AudioStudio
             RefreshPars(-1); RefreshSets(-1);
             RefreshSplits(j);
             Status("Split " + j + " now plays VAG " + picks[0].Vag + " (new param " + npi + ", set " + sp.SetIndex + ").");
-        }
-
-        private void SplitRemove()
-        {
-            var p = SelProgram(); int j = SelIdx(lvSplit);
-            if (p == null || j < 0) return;
-            p.Splits.RemoveAt(j);
-            dirty = true;
-            RefreshSplits(Math.Min(j, p.Splits.Count - 1));
-            UpdateRow(lvProg, SelIdx(lvProg), ProgRow(SelIdx(lvProg)));
         }
 
         private void SplitMove(int dir)
