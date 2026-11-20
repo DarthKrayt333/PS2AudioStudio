@@ -4,7 +4,6 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using PS2AudioStudio.Archives;
-
 namespace PS2AudioStudio.Audio
 {
     /// <summary>What happened to every note of a render: which ones made no sound and why.</summary>
@@ -16,14 +15,13 @@ namespace PS2AudioStudio.Audio
         public int FlagLoopOverrides;          // samples looped by their ADPCM flags although the HD says one-shot
         public int EventsDroppedAfterLoop;
         public bool Looped;
+        public bool EffectsOn;                 // the PS1 reverb was requested for this render
+        public int WetVoices;                  // voices that were sent to the reverb (HD byte 41 = wet)
         public readonly Dictionary<string, int> Details = new Dictionary<string, int>();
         public readonly SortedDictionary<int, int> UnhandledCc = new SortedDictionary<int, int>();
-
         internal void AddDetail(string s) { Details.TryGetValue(s, out int n); Details[s] = n + 1; }
         internal void CountCc(int cc) { UnhandledCc.TryGetValue(cc, out int n); UnhandledCc[cc] = n + 1; }
-
         public int NotesSilent { get { return NotesTotal - NotesPlayed; } }
-
         public string ToText()
         {
             var sb = new StringBuilder();
@@ -36,6 +34,12 @@ namespace PS2AudioStudio.Audio
             if (NotesNoGain > 0) sb.AppendLine($"  - volume resolved to 0: {NotesNoGain:N0}");
             sb.AppendLine($"Voices: {VoicesCreated:N0} created, peak {PeakVoices} at once, {VoicesStolen:N0} stolen (limit {VoiceLimit}).");
             sb.AppendLine($"Samples looped by their ADPCM loop flags although the HD says one-shot: {FlagLoopOverrides}");
+            if (EffectsOn)
+            {
+                if (WetVoices > 0) sb.AppendLine($"Effects ON: PS1 reverb (Studio Large) run over {WetVoices:N0} wet voices (samples flagged wet in HD byte 41).");
+                else sb.AppendLine("Effects ON, but no sample of this bank is flagged wet (HD byte 41) - nothing was sent to the reverb.");
+            }
+            else sb.AppendLine("Effects OFF: dry render.");
             if (Looped && EventsDroppedAfterLoop > 0)
                 sb.AppendLine($"Events after the loop-end marker not rendered: {EventsDroppedAfterLoop:N0} (a looped render stops at the loop end).");
             if (Details.Count > 0)
@@ -49,20 +53,20 @@ namespace PS2AudioStudio.Audio
             return sb.ToString();
         }
     }
-
     /// <summary>
     /// Offline sampler: plays an SQ / MIDI song through the instruments of an HD+BD bank
     /// (program -> split (key range) -> sample set (velocity range) -> sample param -> VAG sample)
     /// and returns the finished stereo audio. SPU ADSR envelopes are emulated per output sample (48 kHz = SPU2 rate).
+    /// With effects = true, voices whose sample is flagged wet (HD byte 41) are also fed to the PS1 reverb.
     /// </summary>
     public static class Psf2Renderer
     {
         public const int OutRate = 48000;
-
         /// <summary>The SPU2 loops by the loop flags inside the ADPCM data, not by the HD attribute byte. Set false to get the old behaviour.</summary>
         public static bool LoopFromAdpcmFlags = true;
         public static int MaxVoices = 160;
-
+        /// <summary>GM / SPU style volume: CC7 and CC11 act as squares (40*log10). false = old linear mixing.</summary>
+        public static bool SquaredVolume = true;
         // ------------------------------------------------------------------ SPU envelope
         private sealed class Env
         {
@@ -71,7 +75,6 @@ namespace PS2AudioStudio.Audio
             private int atkShift, atkStep, decShift, susLevel, susShift, susStep, relShift;
             public bool Dead;
             public int Level => level;
-
             public Env(ushort a1, ushort a2)
             {
                 atkExp = (a1 & 0x8000) != 0;
@@ -87,10 +90,8 @@ namespace PS2AudioStudio.Audio
                 relShift = a2 & 0x1F;
                 level = 0; phase = 0; counter = 0;
             }
-
             public void Release() { if (phase != 3) { phase = 3; counter = 0; } }
             public bool Releasing => phase == 3;
-
             public void Tick()
             {
                 int shift, step; bool exp, dec;
@@ -105,7 +106,6 @@ namespace PS2AudioStudio.Audio
                 int astep = step << Math.Max(0, 11 - shift);
                 if (exp && !dec && level > 0x6000) cycles *= 4;
                 if (exp && dec) astep = (astep * level) >> 15;
-
                 if (++counter >= cycles)
                 {
                     counter = 0;
@@ -113,13 +113,11 @@ namespace PS2AudioStudio.Audio
                     if (level > 0x7FFF) level = 0x7FFF;
                     if (level < 0) level = 0;
                 }
-
                 if (phase == 0 && level >= 0x7FFF) phase = 1;
                 else if (phase == 1 && level <= susLevel) phase = 2;
                 else if (phase == 3 && level <= 0) Dead = true;
             }
         }
-
         // ------------------------------------------------------------------ voice / channel state
         private sealed class Voice
         {
@@ -134,18 +132,17 @@ namespace PS2AudioStudio.Audio
             public bool Held;              // note-off received while sustain pedal down
             public bool KeyUp;
             public bool PlayOnce;          // sustained song end: play the sample to its loop end once, then stop
+            public bool Wet;               // also sent to the reverb bus
             public long ReleaseAge;
         }
-
         private sealed class Chan
         {
             public int Bank, Program, Vol = 127, Expr = 127, Pan = 64, Bend = 8192;
             public int BendRange = 2;                 // semitones (RPN 0,0)
             public int RpnMsb = 127, RpnLsb = 127;    // 127/127 = "null" RPN
             public bool Sustain;
-            public float Gain => (Vol / 127f) * (Expr / 127f);
+            public float Gain { get { float v = Vol / 127f, e = Expr / 127f; return SquaredVolume ? v * v * e * e : v * e; } }
         }
-
         private sealed class RSample
         {
             public float[] Data;
@@ -153,21 +150,19 @@ namespace PS2AudioStudio.Audio
             public int LoopStart, LoopEnd;
             public double Rate;
         }
-
         private sealed class Ctx
         {
             public Psf2Bank Bank;
             public List<Voice> Voices;
             public Psf2RenderReport Report;
+            public bool Effects;
             public readonly Dictionary<int, RSample> Cache = new Dictionary<int, RSample>();
         }
-
         private static int PanConv(int v)
         {
             if (v > 0x7F) return 0x40 - (v - 0x7F);
             return v - 0x40;
         }
-
         /// <summary>Number of notes that are still on (no note-off) after the very last event of the song.</summary>
         private static int CountHeldAtEnd(SqSong song)
         {
@@ -186,33 +181,29 @@ namespace PS2AudioStudio.Audio
             }
             return held.Count;
         }
-
         // ------------------------------------------------------------------ render
         public static AudioBuffer Render(Psf2Bank bank, SqSong song, IProgress<int> progress = null,
                                          CancellationToken ct = default, bool honorLoop = true,
-                                         Psf2RenderReport report = null)
+                                         Psf2RenderReport report = null, bool effects = false)
         {
             if (bank == null || !bank.Loaded) throw new InvalidOperationException("Load an HD/BD bank first.");
             if (song == null || song.Events.Count == 0) throw new InvalidOperationException("The song has no events.");
             if (report == null) report = new Psf2RenderReport();
             report.VoiceLimit = MaxVoices;
-
+            report.EffectsOn = effects;
             double[] secs = song.EventSeconds();
             int evCount = song.Events.Count;
             long maxFrames = (long)OutRate * 60 * 12;
-
             // ---- notes that are never switched off (one-VAG mini hacks): the game keeps them ringing, so do we
             int heldAtEnd = CountHeldAtEnd(song);
             bool sustained = heldAtEnd > 0;
             if (sustained)
                 report.AddDetail(heldAtEnd + " note(s) have no note-off: they play out their whole sample once (like the game)");
-
             // ---- event timeline: normal, or "intro + loop body + one more lap of the body"
             var evIndex = new List<int>(evCount * 2);
             var evFrames = new List<long>(evCount * 2);
             bool looped = false;
             long loopStartF = 0, loopLenF = 0;
-
             if (!sustained && honorLoop && song.TryGetLoopRange(out int sIdx, out int eIdx))
             {
                 int endI = Math.Min(eIdx, evCount);
@@ -236,7 +227,6 @@ namespace PS2AudioStudio.Audio
                 for (int i = 0; i < evCount; i++) { evIndex.Add(i); evFrames.Add((long)(secs[i] * OutRate)); }
             }
             report.Looped = looped;
-
             long endFrame, lastEventFrame;
             if (looped)
             {
@@ -250,17 +240,16 @@ namespace PS2AudioStudio.Audio
                 endFrame = (long)(lastSec * OutRate) + OutRate * (sustained ? 10 : 6);   // sustained: grows while notes still play
                 if (endFrame > maxFrames) endFrame = maxFrames;
             }
-
             float[] L = new float[endFrame], R = new float[endFrame];
+            float[] WL = effects ? new float[endFrame] : null;      // reverb send bus (only the wet voices)
+            float[] WR = effects ? new float[endFrame] : null;
             var chans = new Chan[16];
             for (int i = 0; i < 16; i++) chans[i] = new Chan();
             var voices = new List<Voice>(128);
-            var ctx = new Ctx { Bank = bank, Voices = voices, Report = report };
-
+            var ctx = new Ctx { Bank = bank, Voices = voices, Report = report, Effects = effects };
             int ei = 0;
             bool endReleased = looped;          // looped renders are cut, not released
             int lastPct = -1;
-
             for (long f = 0; f < endFrame; f++)
             {
                 if ((f & 0x3FFF) == 0)
@@ -269,15 +258,14 @@ namespace PS2AudioStudio.Audio
                     int pct = (int)(f * 100 / endFrame);
                     if (pct != lastPct) { lastPct = pct; progress?.Report(pct); }
                 }
-
                 // ---- sustained songs: keep the buffer growing while voices are still playing
                 if (sustained && f >= endFrame - 1 && voices.Count > 0 && endFrame < maxFrames)
                 {
                     endFrame = Math.Min(maxFrames, endFrame + OutRate * 10);
                     Array.Resize(ref L, (int)endFrame);
                     Array.Resize(ref R, (int)endFrame);
+                    if (WL != null) { Array.Resize(ref WL, (int)endFrame); Array.Resize(ref WR, (int)endFrame); }
                 }
-
                 // ---- events
                 while (ei < evIndex.Count && evFrames[ei] <= f)
                 {
@@ -329,7 +317,6 @@ namespace PS2AudioStudio.Audio
                             break;
                     }
                 }
-
                 // ---- after the last event (non-looped songs): release everything,
                 //      except notes that were never switched off in a sustained song: they play their sample out once
                 if (!endReleased && f >= lastEventFrame)
@@ -342,23 +329,18 @@ namespace PS2AudioStudio.Audio
                     }
                 }
                 if (!looped && endReleased && voices.Count == 0 && f > lastEventFrame + 1000) { endFrame = f; break; }
-
                 if (voices.Count > report.PeakVoices) report.PeakVoices = voices.Count;
-
                 // ---- mix
-                float l = 0, r = 0;
+                float l = 0, r = 0, wl = 0, wr = 0;
                 for (int vi = voices.Count - 1; vi >= 0; vi--)
                 {
                     var v = voices[vi];
                     var ch = chans[v.Channel];
-
                     v.Env.Tick();
                     if (v.Env.Releasing) { v.ReleaseAge++; if (v.ReleaseAge > OutRate * 12 || v.Env.Level < 8) v.Env.Dead = true; }
                     if (v.Env.Dead) { voices.RemoveAt(vi); continue; }
-
                     double bend = ((ch.Bend - 8192) / 8192.0) * ch.BendRange;
                     double step = bend == 0 ? v.BaseStep : v.BaseStep * Math.Pow(2.0, bend / 12.0);
-
                     int i0 = (int)v.Pos;
                     double fr = v.Pos - i0;
                     float[] d = v.Data;
@@ -367,14 +349,15 @@ namespace PS2AudioStudio.Audio
                     if (v.Loop && i1 >= v.LoopEnd) i1 = v.LoopStart;
                     float s1 = i1 < d.Length ? d[i1] : 0f;
                     float smp = s0 + (float)fr * (s1 - s0);
-
                     float amp = smp * (v.Env.Level / 32767f) * v.Gain * ch.Gain;
                     int pan = 64 + v.PanOffset + (ch.Pan - 64);
                     if (pan < 0) pan = 0; else if (pan > 127) pan = 127;
                     double ang = pan / 127.0 * (Math.PI / 2);
-                    l += amp * (float)Math.Cos(ang);
-                    r += amp * (float)Math.Sin(ang);
-
+                    float al = amp * (float)Math.Cos(ang);
+                    float ar = amp * (float)Math.Sin(ang);
+                    l += al;
+                    r += ar;
+                    if (v.Wet) { wl += al; wr += ar; }
                     v.Pos += step;
                     if (v.Loop && v.PlayOnce && v.Pos >= v.LoopEnd) v.Loop = false;   // sustained end: leave the loop, finish the data
                     if (v.Loop)
@@ -384,10 +367,16 @@ namespace PS2AudioStudio.Audio
                     else if (v.Pos >= d.Length - 1) { voices.RemoveAt(vi); }
                 }
                 L[f] = l; R[f] = r;
+                if (WL != null) { WL[f] = wl; WR[f] = wr; }
             }
-
             progress?.Report(100);
-
+            // ---- effects: the wet bus goes through the PS1 reverb and is added to the dry mix
+            if (effects && report.WetVoices > 0 && WL != null)
+            {
+                int cnt = (int)Math.Min(endFrame, (long)Math.Min(WL.Length, L.Length));
+                new Ps1Reverb().Process(WL, WR, cnt, OutRate);
+                for (int i = 0; i < cnt; i++) { L[i] += WL[i]; R[i] += WR[i]; }
+            }
             AudioBuffer outBuf;
             if (looped)
             {
@@ -417,7 +406,6 @@ namespace PS2AudioStudio.Audio
                 int trimmed = frames;
                 while (trimmed > 1 && Math.Abs(L[trimmed - 1]) < 1e-5f && Math.Abs(R[trimmed - 1]) < 1e-5f) trimmed--;
                 frames = Math.Min(L.Length, trimmed + OutRate / 10);
-
                 outBuf = new AudioBuffer(OutRate, 2, frames);
                 for (int i = 0; i < frames; i++)
                 {
@@ -425,7 +413,6 @@ namespace PS2AudioStudio.Audio
                     outBuf.Samples[i * 2 + 1] = R[i];
                 }
             }
-
             float peak = 0;
             for (int i = 0; i < outBuf.Samples.Length; i++)
             {
@@ -439,12 +426,10 @@ namespace PS2AudioStudio.Audio
             }
             return outBuf;
         }
-
         // ------------------------------------------------------------------ sample lookup (loop by ADPCM flags)
         private static RSample GetSample(Ctx c, int index)
         {
             if (c.Cache.TryGetValue(index, out RSample cached)) return cached;
-
             RSample rs = null;
             var s = c.Bank.Samples[index];
             var dec = s.Decoded;
@@ -459,7 +444,6 @@ namespace PS2AudioStudio.Audio
                     LoopStart = dec.LoopStart,
                     LoopEnd = Math.Min(dec.LoopEnd, dec.Samples.Length)
                 };
-
                 if (LoopFromAdpcmFlags && s.Attribute == 0)
                 {
                     AudioBuffer raw = null;
@@ -478,7 +462,6 @@ namespace PS2AudioStudio.Audio
             c.Cache[index] = rs;
             return rs;
         }
-
         private static void StealVoice(Ctx c)
         {
             int idx = c.Voices.FindIndex(v => v.Env.Releasing);   // prefer a voice that is already fading out
@@ -486,12 +469,10 @@ namespace PS2AudioStudio.Audio
             c.Voices.RemoveAt(idx);
             c.Report.VoicesStolen++;
         }
-
         private static void NoteOn(Ctx c, int chIdx, Chan ch, int key, int vel)
         {
             var bank = c.Bank; var rep = c.Report; var voices = c.Voices;
             rep.NotesTotal++;
-
             int progIdx = ch.Bank * 128 + ch.Program;
             Psf2Program prog;
             if (!bank.Programs.TryGetValue(progIdx, out prog))
@@ -501,14 +482,11 @@ namespace PS2AudioStudio.Audio
                     rep.AddDetail($"program {ch.Program} (bank {ch.Bank}) is not in the HD (channel {chIdx + 1})");
                     return;
                 }
-
             // retrigger: choke a still-held identical key on this channel
             foreach (var old in voices)
                 if (old.Channel == chIdx && old.Key == key && !old.KeyUp) { old.KeyUp = true; old.Env.Release(); }
-
             bool anyKey = false, anySet = false, anyVel = false, anySmp = false;
             int made = 0;
-
             foreach (var split in prog.Splits)
             {
                 if (key < split.RangeLow || key > split.RangeHigh) continue;
@@ -517,31 +495,26 @@ namespace PS2AudioStudio.Audio
                 var set = bank.SampleSets[split.SampleSetIndex];
                 if (set == null) continue;
                 anySet = true;
-
                 foreach (int spi in set.SampleParams)
                 {
                     if (spi < 0 || spi >= bank.SampleParams.Length) continue;
                     var sp = bank.SampleParams[spi];
                     if (sp == null) continue;
-
                     int sl = set.VelLow, sh = set.VelHigh; if (sl == 0 && sh == 0) sh = 127;     // unset range = everything
                     int pl = sp.VelLow, ph = sp.VelHigh; if (pl == 0 && ph == 0) ph = 127;
                     int vLow = Math.Max(sl, pl);
                     int vHigh = Math.Min(sh, ph);
                     if (vLow <= vHigh && (vel < vLow || vel > vHigh)) continue;
                     anyVel = true;
-
                     if (sp.VagIndex < 0 || sp.VagIndex >= bank.Samples.Count) continue;
                     var rs = GetSample(c, sp.VagIndex);
                     if (rs == null) continue;
                     anySmp = true;
-
                     double semis = (key - sp.BaseNote) + split.Transpose + (split.Detune / 100.0);
                     double step = (rs.Rate / OutRate) * Math.Pow(2.0, semis / 12.0);
-
                     float gain = (prog.Volume / 127f) * (split.Volume / 127f) * (sp.Volume / 127f) * (vel / 127f) * 0.5f;
                     if (gain <= 0) continue;
-
+                    bool wet = c.Effects && sp.Wet;
                     var v = new Voice
                     {
                         Data = rs.Data,
@@ -553,17 +526,17 @@ namespace PS2AudioStudio.Audio
                         PanOffset = PanConv(sp.Panpot) + PanConv(prog.Panpot) + PanConv(split.Panpot),
                         Channel = chIdx,
                         Key = key,
+                        Wet = wet,
                         Env = new Env(sp.Adsr1, sp.Adsr2)
                     };
                     voices.Add(v);
                     made++;
                     rep.VoicesCreated++;
+                    if (wet) rep.WetVoices++;
                     if (voices.Count > MaxVoices) StealVoice(c);
                 }
             }
-
             if (made > 0) { rep.NotesPlayed++; return; }
-
             if (!anyKey) { rep.NotesNoSplit++; rep.AddDetail($"program {progIdx}: no split covers key {key}"); }
             else if (!anySet) { rep.NotesNoSet++; rep.AddDetail($"program {progIdx}: split points to a missing sample set"); }
             else if (!anyVel) { rep.NotesNoVelocity++; rep.AddDetail($"program {progIdx}: nothing for velocity {vel} (key {key})"); }
