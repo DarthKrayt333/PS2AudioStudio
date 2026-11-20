@@ -29,7 +29,7 @@ namespace PS2AudioStudio
         private bool _midiShown;
 
         private TabControl tabs;
-        private TabPage tabEditor, tabPsf2, tabAfs;
+        private TabPage tabEditor, tabPsf2, tabAfs, tabPsf;
         private Label lblStatus, lblTime, lblRate;
         private TrackBar trkVol;
         private Button bRec, bPlay, bPause, bStop, bStart, bEnd;
@@ -116,7 +116,8 @@ namespace PS2AudioStudio
             tabEditor = BuildEditorTab();
             tabPsf2 = BuildPsf2Tab();
             tabAfs = BuildAfsTab();
-            tabs.TabPages.AddRange(new[] { tabEditor, tabPsf2, tabAfs });
+            tabPsf = BuildPsfTab();
+            tabs.TabPages.AddRange(new[] { tabEditor, tabPsf2, tabAfs, tabPsf });
             foreach (TabPage t in tabs.TabPages) { t.BackColor = Ui.Bg; t.ForeColor = Color.White; }
 
             var menu = BuildMenu();
@@ -206,7 +207,7 @@ namespace PS2AudioStudio
             var help = new ToolStripMenuItem("&Help");
             help.DropDownItems.Add(Mi("Loop points & formats - quick notes", (s, e) => ShowNotes()));
             help.DropDownItems.Add(Mi("About", (s, e) => MessageBox.Show(this,
-                "PS2 Audio Studio\nVAG / ADX / WAV / MP3 / M4A editor, AFS archive manager and PSF2 (HD/BD/SQ) bank player.\n\nMade by DarthKrayt333",
+                "PS2 Audio Studio v1.0.2\nVAG / ADX / WAV / MP3 / M4A editor, AFS archive manager and PSF2 (HD/BD/SQ) bank player.\n\nMade by DarthKrayt333",
                 "About")));
 
             m.Items.AddRange(new ToolStripItem[] { file, edit, fx, view, tr, settings, help });
@@ -280,13 +281,13 @@ namespace PS2AudioStudio
 
         private void InitSplitters()
         {
-            try { InitEditorSplitters(); InitPsf2Splitters(); InitAfsSplitters(); } catch { }
+            try { InitEditorSplitters(); InitPsf2Splitters(); InitAfsSplitters(); InitPsfSplitters(); } catch { }
         }
 
         // ================================================================= helpers
 
         private WaveformControl ActiveWave =>
-            tabs.SelectedTab == tabPsf2 ? psf2Wave : tabs.SelectedTab == tabAfs ? afsWave : wave;
+            tabs.SelectedTab == tabPsf2 ? psf2Wave : tabs.SelectedTab == tabAfs ? afsWave : tabs.SelectedTab == tabPsf ? psfWave : wave;
 
         private void SetStatus(string s) { if (lblStatus != null) lblStatus.Text = s; }
 
@@ -296,6 +297,7 @@ namespace PS2AudioStudio
             if (tabs.SelectedTab == tabEditor && !string.IsNullOrEmpty(editorName)) t += " - " + Path.GetFileName(editorName);
             else if (tabs.SelectedTab == tabPsf2 && bank != null && bank.Loaded) t += " - " + Path.GetFileName(bank.HdPath) + (bank.Modified ? " *" : "");
             else if (tabs.SelectedTab == tabAfs && afs != null && afs.Path != null) t += " - " + Path.GetFileName(afs.Path) + (afs.Modified ? " *" : "");
+            else if (tabs.SelectedTab == tabPsf && !string.IsNullOrEmpty(psfPath)) t += " - " + Path.GetFileName(psfPath);
             Text = t;
         }
 
@@ -544,9 +546,9 @@ namespace PS2AudioStudio
             {
                 int i = SelectedSampleIndex();
                 var r = MessageBox.Show(this,
-                    $"Replace PSF2 sample #{i} with\n{Path.GetFileName(audio[0])} ?\n\nYes = replace the sample (keeps the sample's original rate)\nNo = just open it in the editor",
+                    $"Replace PSF2 sample #{i} with\n{Path.GetFileName(audio[0])} ?\n\nYes = replace the sample (uses the file's own sample rate)\nNo = just open it in the editor",
                     "Drop audio on bank", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-                if (r == DialogResult.Yes) { ReplaceSampleFromFile(i, audio[0], true); return; }
+                if (r == DialogResult.Yes) { ReplaceSampleFromFile(i, audio[0], false); return; }
                 if (r == DialogResult.Cancel) return;
             }
             else if (tab == tabAfs && afs != null && (afs.Entries.Count > 0 || afs.Path != null))
