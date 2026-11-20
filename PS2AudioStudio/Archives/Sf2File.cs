@@ -10,6 +10,7 @@ namespace PS2AudioStudio.Archives
     {
         public const int StartAddrsOffset = 0, EndAddrsOffset = 1, StartLoopOffset = 2, EndLoopOffset = 3;
         public const int StartAddrsCoarse = 4, EndAddrsCoarse = 12;
+        public const int ReverbEffectsSend = 16;
         public const int Pan = 17;
         public const int DelayVolEnv = 33, AttackVolEnv = 34, HoldVolEnv = 35, DecayVolEnv = 36, SustainVolEnv = 37, ReleaseVolEnv = 38;
         public const int Instrument = 41, KeyRange = 43, VelRange = 44;
@@ -357,6 +358,35 @@ namespace PS2AudioStudio.Archives
             body.Write(sdta, 0, sdta.Length);
             body.Write(pdta, 0, pdta.Length);
             return Chunk("RIFF", body.ToArray());
+        }
+
+        /// <summary>Reverb send VGMTrans writes in its SF2 (generator 16 = 250, 25 %), measured with fx_scan.py.</summary>
+        public const int VgmTransReverbSend = 250;
+
+        /// <summary>amount > 0: sets reverbEffectsSend on every instrument zone of every preset. amount &lt;= 0: removes it.</summary>
+        public void SetReverbSend(int amount)
+        {
+            foreach (var p in Presets)
+                foreach (var z in p.Zones)
+                {
+                    if (z.IsGlobal) continue;
+                    if (amount > 0) z.Gens[Sf2Gen.ReverbEffectsSend] = (short)Math.Min(1000, amount);
+                    else z.Gens.Remove(Sf2Gen.ReverbEffectsSend);
+                }
+        }
+
+        /// <summary>Highest reverbEffectsSend found in the file (preset or instrument zones), 0 = none.</summary>
+        public int MaxReverbSend()
+        {
+            int m = 0;
+            short v;
+            foreach (var p in Presets)
+                foreach (var z in p.Zones)
+                    if (z.Gens.TryGetValue(Sf2Gen.ReverbEffectsSend, out v) && v > m) m = v;
+            foreach (var it in Instruments)
+                foreach (var z in it.Zones)
+                    if (z.Gens.TryGetValue(Sf2Gen.ReverbEffectsSend, out v) && v > m) m = v;
+            return m;
         }
 
         public string Summary()
